@@ -3,6 +3,7 @@ package dev.rasne.intactpdf.core
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.RectF
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -19,6 +20,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.UUID
 
 class PdfEngine(private val context: Context) {
 
@@ -241,6 +243,264 @@ class PdfEngine(private val context: Context) {
                 currentFile = targetFile
                 openRendererHandles(targetFile)
                 return@withContext Result.success(Unit)
+            } catch (e: Exception) {
+                try {
+                    currentFile?.let { openRendererHandles(it) }
+                } catch (_: Exception) {}
+                return@withContext Result.failure(e)
+            }
+        }
+    }
+
+    suspend fun addTextLive(
+        targetFile: File,
+        pageIndex: Int,
+        text: String,
+        normX: Float,
+        normY: Float,
+        fontSize: Float
+    ): Result<PdfTextBlock> = withContext(Dispatchers.IO) {
+        rendererMutex.withLock {
+            try {
+                closeRendererHandles()
+
+                var newBlock: PdfTextBlock? = null
+                PDDocument.load(targetFile).use { doc ->
+                    val (font, isUnicodeFont) = resolveFont(doc)
+                    if (pageIndex in 0 until doc.numberOfPages) {
+                        val page = doc.getPage(pageIndex)
+                        val pageWidth = page.mediaBox.width
+                        val pageHeight = page.mediaBox.height
+
+                        val contentStream = PDPageContentStream(
+                            doc,
+                            page,
+                            PDPageContentStream.AppendMode.APPEND,
+                            true,
+                            true
+                        )
+
+                        val textToWrite = if (isUnicodeFont) text else sanitizeForType1(text)
+                        val targetFontSize = if (fontSize > 0f) fontSize else 14f
+
+                        val textWidth = try {
+                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                        } catch (e: Exception) {
+                            val san = sanitizeForType1(textToWrite)
+                            try {
+                                font.getStringWidth(san) / 1000f * targetFontSize
+                            } catch (_: Exception) {
+                                san.length * targetFontSize * 0.5f
+                            }
+                        }
+
+                        val x = normX * pageWidth
+                        val y = pageHeight - (normY * pageHeight)
+
+                        contentStream.beginText()
+                        contentStream.setFont(font, targetFontSize)
+                        contentStream.setNonStrokingColor(0f, 0f, 0f)
+                        contentStream.newLineAtOffset(x, y)
+                        try {
+                            contentStream.showText(textToWrite)
+                        } catch (e: Exception) {
+                            contentStream.showText(sanitizeForType1(textToWrite))
+                        }
+                        contentStream.endText()
+                        contentStream.close()
+
+                        val topOfChar = normY - (targetFontSize * 1.15f / pageHeight)
+                        val bottomOfChar = normY + (targetFontSize * 0.35f / pageHeight)
+                        val normWidth = textWidth / pageWidth
+
+                        val normRect = RectF(
+                            normX.coerceIn(0f, 1f),
+                            topOfChar.coerceIn(0f, 1f),
+                            (normX + normWidth).coerceIn(0f, 1f),
+                            bottomOfChar.coerceIn(0f, 1f)
+                        )
+                        val pdfRect = RectF(
+                            x,
+                            topOfChar * pageHeight,
+                            x + textWidth,
+                            bottomOfChar * pageHeight
+                        )
+
+                        newBlock = PdfTextBlock(
+                            id = UUID.randomUUID().toString(),
+                            text = textToWrite,
+                            pageIndex = pageIndex,
+                            normalizedBounds = normRect,
+                            pdfBounds = pdfRect,
+                            fontSize = targetFontSize,
+                            baselineY = normY * pageHeight
+                        )
+                    }
+
+                    doc.save(targetFile)
+                }
+
+                currentFile = targetFile
+                openRendererHandles(targetFile)
+                return@withContext if (newBlock != null) Result.success(newBlock!!) else Result.failure(IllegalStateException("Sayfa bulunamadı."))
+            } catch (e: Exception) {
+                try {
+                    currentFile?.let { openRendererHandles(it) }
+                } catch (_: Exception) {}
+                return@withContext Result.failure(e)
+            }
+        }
+    }
+
+    suspend fun moveTextBlockLive(
+        targetFile: File,
+        block: PdfTextBlock,
+        newNormX: Float,
+        newNormY: Float
+    ): Result<PdfTextBlock> = withContext(Dispatchers.IO) {
+        rendererMutex.withLock {
+            try {
+                closeRendererHandles()
+
+                var updatedBlock: PdfTextBlock? = null
+                PDDocument.load(targetFile).use { doc ->
+                    val (font, isUnicodeFont) = resolveFont(doc)
+                    val pageIdx = block.pageIndex
+
+                    if (pageIdx in 0 until doc.numberOfPages) {
+                        val page = doc.getPage(pageIdx)
+                        val pageWidth = page.mediaBox.width
+                        val pageHeight = page.mediaBox.height
+
+                        val contentStream = PDPageContentStream(
+                            doc,
+                            page,
+                            PDPageContentStream.AppendMode.APPEND,
+                            true,
+                            true
+                        )
+
+                        // 1. Cover original text with whiteout
+                        val bounds = block.pdfBounds
+                        val pdfY = pageHeight - bounds.bottom
+                        val boxHeight = bounds.height()
+                        val boxWidth = bounds.width()
+
+                        val padX = maxOf(4f, block.fontSize * 0.12f)
+                        val padY = maxOf(3f, block.fontSize * 0.10f)
+
+                        contentStream.setNonStrokingColor(1f, 1f, 1f)
+                        contentStream.addRect(
+                            bounds.left - padX,
+                            pdfY - padY,
+                            boxWidth + (padX * 2f),
+                            boxHeight + (padY * 2f)
+                        )
+                        contentStream.fill()
+
+                        // 2. Draw text at new location
+                        val textToWrite = if (isUnicodeFont) block.text else sanitizeForType1(block.text)
+                        val targetFontSize = if (block.fontSize > 0f) block.fontSize else 12f
+
+                        val textWidth = try {
+                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                        } catch (e: Exception) {
+                            val san = sanitizeForType1(textToWrite)
+                            try {
+                                font.getStringWidth(san) / 1000f * targetFontSize
+                            } catch (_: Exception) {
+                                san.length * targetFontSize * 0.5f
+                            }
+                        }
+
+                        val newX = newNormX * pageWidth
+                        val newY = pageHeight - (newNormY * pageHeight)
+
+                        contentStream.beginText()
+                        contentStream.setFont(font, targetFontSize)
+                        contentStream.setNonStrokingColor(0f, 0f, 0f)
+                        contentStream.newLineAtOffset(newX, newY)
+                        try {
+                            contentStream.showText(textToWrite)
+                        } catch (e: Exception) {
+                            contentStream.showText(sanitizeForType1(textToWrite))
+                        }
+                        contentStream.endText()
+                        contentStream.close()
+
+                        val topOfChar = newNormY - (targetFontSize * 1.15f / pageHeight)
+                        val bottomOfChar = newNormY + (targetFontSize * 0.35f / pageHeight)
+                        val normWidth = textWidth / pageWidth
+
+                        val normRect = RectF(
+                            newNormX.coerceIn(0f, 1f),
+                            topOfChar.coerceIn(0f, 1f),
+                            (newNormX + normWidth).coerceIn(0f, 1f),
+                            bottomOfChar.coerceIn(0f, 1f)
+                        )
+                        val pdfRect = RectF(
+                            newX,
+                            topOfChar * pageHeight,
+                            newX + textWidth,
+                            bottomOfChar * pageHeight
+                        )
+
+                        updatedBlock = block.copy(
+                            normalizedBounds = normRect,
+                            pdfBounds = pdfRect,
+                            baselineY = newNormY * pageHeight
+                        )
+                    }
+
+                    doc.save(targetFile)
+                }
+
+                currentFile = targetFile
+                openRendererHandles(targetFile)
+                return@withContext if (updatedBlock != null) Result.success(updatedBlock!!) else Result.failure(IllegalStateException("Metin taşınamadı."))
+            } catch (e: Exception) {
+                try {
+                    currentFile?.let { openRendererHandles(it) }
+                } catch (_: Exception) {}
+                return@withContext Result.failure(e)
+            }
+        }
+    }
+
+    suspend fun addNewPage(
+        targetFile: File,
+        insertAfterPageIndex: Int = -1
+    ): Result<Int> = withContext(Dispatchers.IO) {
+        rendererMutex.withLock {
+            try {
+                closeRendererHandles()
+
+                var newCount = 0
+                PDDocument.load(targetFile).use { doc ->
+                    val pageSize = if (doc.numberOfPages > 0) {
+                        val first = doc.getPage(0).mediaBox
+                        PDRectangle(first.width, first.height)
+                    } else {
+                        PDRectangle.A4
+                    }
+
+                    val newPage = PDPage(pageSize)
+                    val total = doc.numberOfPages
+
+                    if (insertAfterPageIndex in 0 until (total - 1)) {
+                        val next = doc.getPage(insertAfterPageIndex + 1)
+                        doc.pages.insertBefore(newPage, next)
+                    } else {
+                        doc.addPage(newPage)
+                    }
+
+                    doc.save(targetFile)
+                    newCount = doc.numberOfPages
+                }
+
+                currentFile = targetFile
+                openRendererHandles(targetFile)
+                return@withContext Result.success(newCount)
             } catch (e: Exception) {
                 try {
                     currentFile?.let { openRendererHandles(it) }

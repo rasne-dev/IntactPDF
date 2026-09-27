@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import dev.rasne.intactpdf.model.PdfLoadState
 import dev.rasne.intactpdf.model.ViewerMode
+import dev.rasne.intactpdf.ui.components.AddTextDialog
 import dev.rasne.intactpdf.ui.components.PdfPageView
 import dev.rasne.intactpdf.ui.components.TextEditDialog
 
@@ -57,6 +58,7 @@ fun PdfViewerScreen(
     val statusMessage by viewModel.statusMessage.collectAsState()
 
     var showTextListSheet by remember { mutableStateOf(false) }
+    var showAddTextDialog by remember { mutableStateOf(false) }
 
     // Handle system back press: close document → go home
     BackHandler(enabled = viewModel.isDocumentOpen()) {
@@ -183,6 +185,24 @@ fun PdfViewerScreen(
                             ) {
                                 if (viewerMode == ViewerMode.EDIT) {
                                     DropdownMenuItem(
+                                        text = { Text("Yeni Metin Ekle") },
+                                        leadingIcon = { Icon(Icons.Default.TextFields, contentDescription = null) },
+                                        onClick = {
+                                            menuExpanded = false
+                                            showAddTextDialog = true
+                                        },
+                                        enabled = !isEditing && !isSaving
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Yeni Sayfa Ekle") },
+                                        leadingIcon = { Icon(Icons.Default.PostAdd, contentDescription = null) },
+                                        onClick = {
+                                            menuExpanded = false
+                                            viewModel.addNewPage()
+                                        },
+                                        enabled = !isEditing && !isSaving && !isPageLoading
+                                    )
+                                    DropdownMenuItem(
                                         text = { Text("Sayfadaki Metinler") },
                                         leadingIcon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
                                         onClick = {
@@ -238,34 +258,65 @@ fun PdfViewerScreen(
                 )
             )
         },
+        floatingActionButton = {
+            if (loadState is PdfLoadState.Success && viewerMode == ViewerMode.EDIT) {
+                ExtendedFloatingActionButton(
+                    onClick = { showAddTextDialog = true },
+                    icon = { Icon(Icons.Default.Add, contentDescription = null) },
+                    text = { Text("Metin Ekle") },
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                )
+            }
+        },
         bottomBar = {
-            if (loadState is PdfLoadState.Success && totalPages > 1) {
-                NavigationBar(
-                    tonalElevation = 2.dp
+            if (loadState is PdfLoadState.Success) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 3.dp
                 ) {
-                    IconButton(
-                        onClick = { viewModel.setPage(currentPage - 1) },
-                        enabled = currentPage > 0 && !isPageLoading && !isEditing,
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Default.ChevronLeft, contentDescription = "Önceki Sayfa")
-                    }
-
-                    Text(
-                        text = "${currentPage + 1} / $totalPages",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
+                    Row(
                         modifier = Modifier
-                            .align(Alignment.CenterVertically)
-                            .padding(horizontal = 16.dp)
-                    )
-
-                    IconButton(
-                        onClick = { viewModel.setPage(currentPage + 1) },
-                        enabled = currentPage < totalPages - 1 && !isPageLoading && !isEditing,
-                        modifier = Modifier.weight(1f)
+                            .fillMaxWidth()
+                            .navigationBarsPadding()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.ChevronRight, contentDescription = "Sonraki Sayfa")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = { viewModel.setPage(currentPage - 1) },
+                                enabled = currentPage > 0 && !isPageLoading && !isEditing
+                            ) {
+                                Icon(Icons.Default.ChevronLeft, contentDescription = "Önceki Sayfa")
+                            }
+
+                            Text(
+                                text = "${currentPage + 1} / $totalPages",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 8.dp)
+                            )
+
+                            IconButton(
+                                onClick = { viewModel.setPage(currentPage + 1) },
+                                enabled = currentPage < totalPages - 1 && !isPageLoading && !isEditing
+                            ) {
+                                Icon(Icons.Default.ChevronRight, contentDescription = "Sonraki Sayfa")
+                            }
+                        }
+
+                        if (viewerMode == ViewerMode.EDIT) {
+                            FilledTonalButton(
+                                onClick = { viewModel.addNewPage() },
+                                enabled = !isEditing && !isPageLoading,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.PostAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Sayfa Ekle", fontSize = 12.sp)
+                            }
+                        }
                     }
                 }
             }
@@ -348,7 +399,7 @@ fun PdfViewerScreen(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "Düzenlemek veya silmek istediğiniz metne dokunun",
+                                        text = "Düzenlemek için dokunun, taşımak için sürükleyin",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                                         fontWeight = FontWeight.Medium
@@ -377,6 +428,9 @@ fun PdfViewerScreen(
                                     viewerMode = viewerMode,
                                     onBlockClick = { block ->
                                         if (!isEditing) viewModel.selectBlock(block)
+                                    },
+                                    onBlockMoved = { block, newNormX, newNormY ->
+                                        viewModel.moveTextBlock(block, newNormX, newNormY)
                                     }
                                 )
                             }
@@ -418,6 +472,17 @@ fun PdfViewerScreen(
             onDismiss = { viewModel.selectBlock(null) },
             onSaveEdit = { newText, isRemoved ->
                 viewModel.applyEdit(block, newText, isRemoved)
+            }
+        )
+    }
+
+    // Add New Text Dialog
+    if (showAddTextDialog) {
+        AddTextDialog(
+            onDismiss = { showAddTextDialog = false },
+            onAddText = { text, fontSize ->
+                showAddTextDialog = false
+                viewModel.addNewText(text, fontSize)
             }
         )
     }

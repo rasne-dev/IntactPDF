@@ -263,6 +263,158 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun addNewText(text: String, fontSize: Float = 14f, normX: Float = 0.25f, normY: Float = 0.5f) {
+        if (_isEditing.value || text.isBlank()) return
+        val activeWorkFile = workingFile ?: return
+        val pageIndex = _currentPage.value
+        val activeDocumentGeneration = documentGeneration
+        _isEditing.value = true
+
+        viewModelScope.launch {
+            if (!pageBlocksCache.containsKey(pageIndex)) {
+                pageBlocksCache[pageIndex] = engine.extractTextBlocks(pageIndex, activeWorkFile).toMutableList()
+            }
+
+            pushUndoSnapshot(activeWorkFile)
+
+            val result = engine.addTextLive(
+                targetFile = activeWorkFile,
+                pageIndex = pageIndex,
+                text = text.trim(),
+                normX = normX,
+                normY = normY,
+                fontSize = fontSize
+            )
+
+            result.onSuccess { newBlock ->
+                if (activeDocumentGeneration != documentGeneration) return@onSuccess
+                val currentList = pageBlocksCache[pageIndex] ?: mutableListOf()
+                currentList.add(newBlock)
+                pageBlocksCache[pageIndex] = currentList
+                _textBlocks.value = currentList.toList()
+                _editCount.value = _editCount.value + 1
+                _canUndo.value = undoHistory.isNotEmpty()
+
+                val updatedBitmap = engine.renderPage(pageIndex)
+                if (_currentPage.value == pageIndex) {
+                    _pageBitmap.value = updatedBitmap
+                }
+                _statusMessage.value = "Yeni metin eklendi"
+            }.onFailure { err ->
+                if (activeDocumentGeneration != documentGeneration) return@onFailure
+                if (undoHistory.isNotEmpty()) {
+                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
+                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
+                    _canUndo.value = undoHistory.isNotEmpty()
+                }
+                _statusMessage.value = "Metin ekleme hatası: ${err.message}"
+            }
+            _isEditing.value = false
+        }
+    }
+
+    fun moveTextBlock(block: PdfTextBlock, newNormX: Float, newNormY: Float) {
+        if (_isEditing.value) return
+        val activeWorkFile = workingFile ?: return
+        val pageIndex = block.pageIndex
+        val activeDocumentGeneration = documentGeneration
+        _isEditing.value = true
+
+        viewModelScope.launch {
+            if (!pageBlocksCache.containsKey(pageIndex)) {
+                pageBlocksCache[pageIndex] = engine.extractTextBlocks(pageIndex, activeWorkFile).toMutableList()
+            }
+
+            pushUndoSnapshot(activeWorkFile)
+
+            val result = engine.moveTextBlockLive(
+                targetFile = activeWorkFile,
+                block = block,
+                newNormX = newNormX,
+                newNormY = newNormY
+            )
+
+            result.onSuccess { updatedBlock ->
+                if (activeDocumentGeneration != documentGeneration) return@onSuccess
+                val currentList = pageBlocksCache[pageIndex] ?: mutableListOf()
+                val idx = currentList.indexOfFirst { it.id == block.id }
+                if (idx != -1) {
+                    currentList[idx] = updatedBlock
+                }
+                pageBlocksCache[pageIndex] = currentList
+                if (_currentPage.value == pageIndex) {
+                    _textBlocks.value = currentList.toList()
+                }
+                _editCount.value = _editCount.value + 1
+                _canUndo.value = undoHistory.isNotEmpty()
+
+                val updatedBitmap = engine.renderPage(pageIndex)
+                if (_currentPage.value == pageIndex) {
+                    _pageBitmap.value = updatedBitmap
+                }
+                _statusMessage.value = "Metin taşındı"
+            }.onFailure { err ->
+                if (activeDocumentGeneration != documentGeneration) return@onFailure
+                if (undoHistory.isNotEmpty()) {
+                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
+                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
+                    _canUndo.value = undoHistory.isNotEmpty()
+                }
+                _statusMessage.value = "Metin taşıma hatası: ${err.message}"
+            }
+            _isEditing.value = false
+        }
+    }
+
+    fun addNewPage() {
+        if (_isEditing.value || _isPageLoading.value) return
+        val activeWorkFile = workingFile ?: return
+        val activeDocumentGeneration = documentGeneration
+        val insertAfter = _currentPage.value
+        _isEditing.value = true
+
+        viewModelScope.launch {
+            pushUndoSnapshot(activeWorkFile)
+
+            val result = engine.addNewPage(activeWorkFile, insertAfter)
+
+            result.onSuccess { newTotalPages ->
+                if (activeDocumentGeneration != documentGeneration) return@onSuccess
+                _totalPages.value = newTotalPages
+                _editCount.value = _editCount.value + 1
+                _canUndo.value = undoHistory.isNotEmpty()
+
+                // Shift any cached pages after the inserted index
+                val newCache = mutableMapOf<Int, MutableList<PdfTextBlock>>()
+                pageBlocksCache.forEach { (p, list) ->
+                    if (p <= insertAfter) {
+                        newCache[p] = list
+                    } else {
+                        newCache[p + 1] = list
+                    }
+                }
+                pageBlocksCache.clear()
+                pageBlocksCache.putAll(newCache)
+
+                // Navigate to the newly inserted page
+                val targetPage = (insertAfter + 1).coerceAtMost(newTotalPages - 1)
+                _currentPage.value = targetPage
+                _selectedBlock.value = null
+                _statusMessage.value = "Yeni sayfa eklendi"
+                loadPageData(targetPage, ++pageLoadGeneration, activeDocumentGeneration)
+            }.onFailure { err ->
+                if (activeDocumentGeneration != documentGeneration) return@onFailure
+                if (undoHistory.isNotEmpty()) {
+                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
+                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
+                    _canUndo.value = undoHistory.isNotEmpty()
+                }
+                _statusMessage.value = "Sayfa ekleme hatası: ${err.message}"
+            }
+            _isEditing.value = false
+        }
+    }
+
     fun undoLastEdit() {
         val activeWorkFile = workingFile ?: return
         if (undoHistory.isEmpty()) return
@@ -275,7 +427,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             withContext(Dispatchers.IO) {
                 lastSnapshot.file.copyTo(activeWorkFile, overwrite = true)
                 lastSnapshot.file.delete()
-                engine.openFile(activeWorkFile)
+                val restoredPages = engine.openFile(activeWorkFile)
+                _totalPages.value = restoredPages
+                if (_currentPage.value >= restoredPages) {
+                    _currentPage.value = (restoredPages - 1).coerceAtLeast(0)
+                }
             }
 
             // Restore blocks cache

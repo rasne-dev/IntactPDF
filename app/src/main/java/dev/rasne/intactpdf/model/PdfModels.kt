@@ -36,3 +36,9 @@ enum class ViewerMode {
     EDIT
 }
 
+data class AlignmentGuide(
+    val isVertical: Boolean,
+    val position: Float,
+    val label: String? = null
+)
+
