@@ -1,6 +1,7 @@
 package dev.rasne.intactpdf.ui
 
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -245,6 +246,23 @@ fun PdfViewerScreen(
                                     },
                                     enabled = !isEditing && !isSaving
                                 )
+                                HorizontalDivider()
+                                DropdownMenuItem(
+                                    text = { Text("Gizlilik Politikası") },
+                                    leadingIcon = { Icon(Icons.Default.PrivacyTip, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        try {
+                                            val intent = Intent(
+                                                Intent.ACTION_VIEW,
+                                                Uri.parse("https://rasne-dev.github.io/IntactPDF/privacy-policy")
+                                            )
+                                            context.startActivity(intent)
+                                        } catch (_: Exception) {
+                                            Toast.makeText(context, "Tarayıcı açılamadı.", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                )
                             }
                         }
                     } else {
@@ -333,7 +351,18 @@ fun PdfViewerScreen(
                 is PdfLoadState.Idle -> {
                     WelcomeHomeScreen(
                         onOpenFile = { filePicker.launch(arrayOf("application/pdf")) },
-                        onLoadSample = { viewModel.loadSamplePdf() }
+                        onLoadSample = { viewModel.loadSamplePdf() },
+                        onOpenPrivacyPolicy = {
+                            try {
+                                val intent = Intent(
+                                    Intent.ACTION_VIEW,
+                                    Uri.parse("https://rasne-dev.github.io/IntactPDF/privacy-policy")
+                                )
+                                context.startActivity(intent)
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "Tarayıcı açılamadı.", Toast.LENGTH_SHORT).show()
+                            }
+                        }
                     )
                 }
 
@@ -561,7 +590,8 @@ fun PdfViewerScreen(
 @Composable
 private fun WelcomeHomeScreen(
     onOpenFile: () -> Unit,
-    onLoadSample: () -> Unit
+    onLoadSample: () -> Unit,
+    onOpenPrivacyPolicy: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -655,6 +685,25 @@ private fun WelcomeHomeScreen(
                     text = "Değişiklikleri yeni PDF olarak kaydedin veya paylaşın"
                 )
             }
+        }
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        TextButton(
+            onClick = onOpenPrivacyPolicy
+        ) {
+            Icon(
+                imageVector = Icons.Default.PrivacyTip,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = "Gizlilik Politikası",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
     }
 }
