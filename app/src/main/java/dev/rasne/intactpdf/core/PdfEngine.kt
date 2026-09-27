@@ -23,15 +23,34 @@ class PdfEngine(private val context: Context) {
     private var currentFile: File? = null
     private var pfd: ParcelFileDescriptor? = null
     private var nativeRenderer: PdfRenderer? = null
-    private var pdDocument: PDDocument? = null
 
     suspend fun openFile(file: File): Int = withContext(Dispatchers.IO) {
         close()
         currentFile = file
+        openRendererHandles(file)
+        return@withContext nativeRenderer?.pageCount ?: 0
+    }
+
+    private fun openRendererHandles(file: File) {
+        closeRendererHandles()
         pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         nativeRenderer = PdfRenderer(pfd!!)
-        pdDocument = PDDocument.load(file)
-        return@withContext nativeRenderer?.pageCount ?: 0
+    }
+
+    private fun closeRendererHandles() {
+        try {
+            nativeRenderer?.close()
+        } catch (_: Exception) {}
+        nativeRenderer = null
+
+        try {
+            pfd?.close()
+        } catch (_: Exception) {}
+        pfd = null
+    }
+
+    suspend fun reloadRenderer() = withContext(Dispatchers.IO) {
+        currentFile?.let { openRendererHandles(it) }
     }
 
     suspend fun renderPage(pageIndex: Int, densityMultiplier: Float = 2.0f): Bitmap? = withContext(Dispatchers.IO) {
@@ -50,17 +69,25 @@ class PdfEngine(private val context: Context) {
         return@withContext bitmap
     }
 
-    suspend fun extractTextBlocks(pageIndex: Int): List<PdfTextBlock> = withContext(Dispatchers.IO) {
-        val doc = pdDocument ?: return@withContext emptyList()
-        if (pageIndex < 0 || pageIndex >= doc.numberOfPages) return@withContext emptyList()
+    suspend fun extractTextBlocks(pageIndex: Int, file: File? = currentFile): List<PdfTextBlock> = withContext(Dispatchers.IO) {
+        val targetFile = file ?: return@withContext emptyList()
+        if (!targetFile.exists()) return@withContext emptyList()
 
-        val locator = PdfTextLocator(pageIndex)
-        return@withContext locator.locateTextBlocks(doc)
+        try {
+            val doc = PDDocument.load(targetFile)
+            if (pageIndex < 0 || pageIndex >= doc.numberOfPages) {
+                doc.close()
+                return@withContext emptyList()
+            }
+            val locator = PdfTextLocator(pageIndex)
+            val blocks = locator.locateTextBlocks(doc)
+            doc.close()
+            return@withContext blocks
+        } catch (e: Exception) {
+            return@withContext emptyList()
+        }
     }
 
-    /**
-     * Resolves the best available font supporting Unicode / Turkish characters.
-     */
     private fun resolveFont(doc: PDDocument): Pair<PDFont, Boolean> {
         val candidateFontPaths = listOf(
             "/system/fonts/Roboto-Regular.ttf",
@@ -74,13 +101,10 @@ class PdfEngine(private val context: Context) {
                 try {
                     val font = PDType0Font.load(doc, f)
                     return Pair(font, true)
-                } catch (_: Exception) {
-                    // Try next font candidate
-                }
+                } catch (_: Exception) {}
             }
         }
 
-        // Fallback to standard Type 1 Helvetica font
         return Pair(PDType1Font.HELVETICA, false)
     }
 
@@ -95,22 +119,21 @@ class PdfEngine(private val context: Context) {
     }
 
     /**
-     * Applies layout-preserving text modifications.
-     * Original text bounding box is covered with clean white, and new text is constrained strictly within bounds.
+     * Applies a modification directly to the working PDF file,
+     * re-opens renderer handles, allowing instant live re-rendering.
      */
-    suspend fun applyEdits(
-        operations: List<TextEditOperation>,
-        outputFile: File
-    ): Result<File> = withContext(Dispatchers.IO) {
-        val srcFile = currentFile ?: return@withContext Result.failure(IllegalStateException("Açık belge bulunamadı."))
-
+    suspend fun applyEditLive(
+        operation: TextEditOperation,
+        targetFile: File
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         try {
-            val doc = PDDocument.load(srcFile)
-            val (font, isUnicodeFont) = resolveFont(doc)
-            val editsByPage = operations.groupBy { it.targetBlock.pageIndex }
+            closeRendererHandles()
 
-            for ((pageIdx, edits) in editsByPage) {
-                if (pageIdx < 0 || pageIdx >= doc.numberOfPages) continue
+            val doc = PDDocument.load(targetFile)
+            val (font, isUnicodeFont) = resolveFont(doc)
+            val pageIdx = operation.targetBlock.pageIndex
+
+            if (pageIdx in 0 until doc.numberOfPages) {
                 val page = doc.getPage(pageIdx)
                 val pageHeight = page.mediaBox.height
 
@@ -122,76 +145,70 @@ class PdfEngine(private val context: Context) {
                     true
                 )
 
-                for (op in edits) {
-                    val bounds = op.targetBlock.pdfBounds
+                val bounds = operation.targetBlock.pdfBounds
+                val pdfY = pageHeight - bounds.bottom
+                val boxHeight = bounds.height()
+                val boxWidth = bounds.width()
 
-                    // 1. Redact / White-out the exact bounding box so layout remains completely intact
-                    contentStream.setNonStrokingColor(1f, 1f, 1f)
-                    val pdfY = pageHeight - bounds.bottom
-                    val boxHeight = bounds.height()
-                    val boxWidth = bounds.width()
+                // Cover original text area with clean white
+                contentStream.setNonStrokingColor(1f, 1f, 1f)
+                contentStream.addRect(
+                    bounds.left - 1.5f,
+                    pdfY - 1.5f,
+                    boxWidth + 3f,
+                    boxHeight + 3f
+                )
+                contentStream.fill()
 
-                    // Expand rect slightly (1pt) to completely conceal original text
-                    contentStream.addRect(
-                        bounds.left - 1f,
-                        pdfY - 1f,
-                        boxWidth + 2f,
-                        boxHeight + 2f
-                    )
-                    contentStream.fill()
+                // If not removed, draw the replacement text
+                if (!operation.isRemoved && operation.newText.isNotBlank()) {
+                    var textToWrite = if (isUnicodeFont) operation.newText else sanitizeForType1(operation.newText)
+                    var targetFontSize = operation.targetBlock.fontSize
+                    if (targetFontSize <= 0f) targetFontSize = 12f
 
-                    // 2. If it's a replacement (not deletion), render the new text
-                    if (!op.isRemoved && op.newText.isNotBlank()) {
-                        var textToWrite = if (isUnicodeFont) op.newText else sanitizeForType1(op.newText)
-                        var targetFontSize = op.targetBlock.fontSize
-                        if (targetFontSize <= 0f) targetFontSize = 12f
-
-                        // Calculate text width safely
-                        var textWidth = try {
-                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
-                        } catch (e: Exception) {
-                            // If encoding error occurs, sanitize text and recalculate
-                            textToWrite = sanitizeForType1(textToWrite)
-                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
-                        }
-
-                        // If user input is longer than original slot, scale down font proportionately
-                        // to guarantee ZERO layout shifting of surrounding lines!
-                        if (textWidth > boxWidth && boxWidth > 1f) {
-                            val ratio = (boxWidth / textWidth).coerceIn(0.4f, 1f)
-                            targetFontSize *= ratio
-                        }
-
-                        val targetY = if (op.targetBlock.baselineY > 0f) {
-                            pageHeight - op.targetBlock.baselineY
-                        } else {
-                            pdfY + (boxHeight * 0.15f)
-                        }
-
-                        contentStream.beginText()
-                        contentStream.setFont(font, targetFontSize)
-                        contentStream.setNonStrokingColor(0f, 0f, 0f)
-                        contentStream.newLineAtOffset(bounds.left, targetY)
-                        contentStream.showText(textToWrite)
-                        contentStream.endText()
+                    var textWidth = try {
+                        font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                    } catch (e: Exception) {
+                        textToWrite = sanitizeForType1(textToWrite)
+                        font.getStringWidth(textToWrite) / 1000f * targetFontSize
                     }
+
+                    if (textWidth > boxWidth && boxWidth > 1f) {
+                        val ratio = (boxWidth / textWidth).coerceIn(0.4f, 1f)
+                        targetFontSize *= ratio
+                    }
+
+                    val targetY = if (operation.targetBlock.baselineY > 0f) {
+                        pageHeight - operation.targetBlock.baselineY
+                    } else {
+                        pdfY + (boxHeight * 0.15f)
+                    }
+
+                    contentStream.beginText()
+                    contentStream.setFont(font, targetFontSize)
+                    contentStream.setNonStrokingColor(0f, 0f, 0f)
+                    contentStream.newLineAtOffset(bounds.left, targetY)
+                    contentStream.showText(textToWrite)
+                    contentStream.endText()
                 }
 
                 contentStream.close()
             }
 
-            doc.save(outputFile)
+            doc.save(targetFile)
             doc.close()
 
-            return@withContext Result.success(outputFile)
+            currentFile = targetFile
+            openRendererHandles(targetFile)
+            return@withContext Result.success(Unit)
         } catch (e: Exception) {
+            try {
+                currentFile?.let { openRendererHandles(it) }
+            } catch (_: Exception) {}
             return@withContext Result.failure(e)
         }
     }
 
-    /**
-     * Creates a sample test PDF document so users can instantly test editing.
-     */
     suspend fun createSamplePdf(targetFile: File): File = withContext(Dispatchers.IO) {
         val document = PDDocument()
         val page = PDPage(PDRectangle.A4)
@@ -236,7 +253,7 @@ class PdfEngine(private val context: Context) {
         contentStream.showText("Duzenleme sonrasinda sayfa duzeni ve satir yapisi bozulmaz.")
         contentStream.endText()
 
-        // Paragraph 3 (Highlighted sample)
+        // Paragraph 3
         contentStream.beginText()
         contentStream.setFont(PDType1Font.HELVETICA_BOLD, 12f)
         contentStream.newLineAtOffset(50f, 600f)
@@ -259,19 +276,7 @@ class PdfEngine(private val context: Context) {
     }
 
     fun close() {
-        try {
-            pdDocument?.close()
-        } catch (_: Exception) {}
-        pdDocument = null
-
-        try {
-            nativeRenderer?.close()
-        } catch (_: Exception) {}
-        nativeRenderer = null
-
-        try {
-            pfd?.close()
-        } catch (_: Exception) {}
-        pfd = null
+        closeRendererHandles()
+        currentFile = null
     }
 }

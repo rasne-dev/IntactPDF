@@ -30,3 +30,9 @@ sealed class PdfLoadState {
     data class Success(val pageCount: Int, val title: String) : PdfLoadState()
     data class Error(val message: String) : PdfLoadState()
 }
+
+enum class ViewerMode {
+    VIEW,
+    EDIT
+}
+
