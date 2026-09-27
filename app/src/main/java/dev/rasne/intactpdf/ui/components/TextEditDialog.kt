@@ -6,6 +6,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -19,8 +20,10 @@ import dev.rasne.intactpdf.model.PdfTextBlock
 fun TextEditDialog(
     block: PdfTextBlock,
     currentNewText: String?,
+    hasExistingEdit: Boolean = false,
     onDismiss: () -> Unit,
-    onSaveEdit: (newText: String, isRemoved: Boolean) -> Unit
+    onSaveEdit: (newText: String, isRemoved: Boolean) -> Unit,
+    onRevertEdit: (() -> Unit)? = null
 ) {
     var editedText by remember { mutableStateOf(currentNewText ?: block.text) }
 
@@ -29,13 +32,15 @@ fun TextEditDialog(
             shape = RoundedCornerShape(16.dp),
             color = MaterialTheme.colorScheme.surface,
             tonalElevation = 6.dp,
-            modifier = Modifier.fillMaxWidth().padding(16.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
@@ -47,7 +52,7 @@ fun TextEditDialog(
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "Metin Düzenleme",
+                        text = "Metni Düzenle",
                         style = MaterialTheme.typography.titleMedium
                     )
                 }
@@ -78,38 +83,60 @@ fun TextEditDialog(
                     label = { Text("Yeni Metin") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = false,
-                    maxLines = 3
+                    maxLines = 4
                 )
 
                 Text(
-                    text = "ℹ️ Düzenleme yapıldığında sayfa düzeni ve satır yapısı bozulmaz.",
+                    text = "Metin boyutu orijinal sayfa yapısını koruyacak şekilde ayarlanır.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline
                 )
 
-                Row(
+                // Actions
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Remove button
-                    OutlinedButton(
-                        onClick = { onSaveEdit("", true) },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Delete,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Metni Sil")
+                        OutlinedButton(
+                            onClick = { onSaveEdit("", true) },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Metni Sil")
+                        }
+
+                        if (hasExistingEdit && onRevertEdit != null) {
+                            TextButton(onClick = onRevertEdit) {
+                                Icon(
+                                    imageVector = Icons.Default.Restore,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Geri Al")
+                            }
+                        }
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         TextButton(onClick = onDismiss) {
                             Text("İptal")
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
                         Button(
                             onClick = {
                                 if (editedText.isBlank()) {

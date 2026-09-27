@@ -14,7 +14,8 @@ data class PdfTextBlock(
      * Exact points in PDF space
      */
     val pdfBounds: RectF,
-    val fontSize: Float
+    val fontSize: Float,
+    val baselineY: Float = 0f
 )
 
 data class TextEditOperation(

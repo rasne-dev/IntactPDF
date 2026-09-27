@@ -15,6 +15,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 
 class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -49,10 +51,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     private var activePdfFile: File? = null
 
-    init {
-        // Load default sample PDF so user can test immediately
-        loadSamplePdf()
-    }
+    // Notice: Application starts clean (Idle state). Does NOT open a file automatically!
 
     fun loadSamplePdf() {
         viewModelScope.launch {
@@ -60,9 +59,9 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val sampleFile = File(getApplication<Application>().cacheDir, "sample_intact.pdf")
                 engine.createSamplePdf(sampleFile)
-                openFile(sampleFile, "Sample Document")
+                openFile(sampleFile, "Örnek Belge")
             } catch (e: Exception) {
-                _loadState.value = PdfLoadState.Error("Sample document could not be created: ${e.message}")
+                _loadState.value = PdfLoadState.Error("Örnek belge oluşturulamadı: ${e.message}")
             }
         }
     }
@@ -78,9 +77,10 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                         input.copyTo(output)
                     }
                 }
-                openFile(tempFile, uri.lastPathSegment ?: "Document.pdf")
+                val displayName = uri.lastPathSegment ?: "Belge.pdf"
+                openFile(tempFile, displayName)
             } catch (e: Exception) {
-                _loadState.value = PdfLoadState.Error("Failed to open file: ${e.message}")
+                _loadState.value = PdfLoadState.Error("Dosya açılamadı: ${e.message}")
             }
         }
     }
@@ -123,7 +123,54 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         )
         _pendingEdits.value = _pendingEdits.value + (block.id to op)
         _selectedBlock.value = null
-        _statusMessage.value = if (isRemoved) "Metin kaldırıldı (Düzen korundu)" else "Metin güncellendi (Düzen korundu)"
+        _statusMessage.value = if (isRemoved) "Metin silindi" else "Metin güncellendi"
+    }
+
+    fun undoEdit(blockId: String) {
+        _pendingEdits.value = _pendingEdits.value - blockId
+        _statusMessage.value = "Değişiklik geri alındı"
+    }
+
+    fun closeDocument() {
+        engine.close()
+        activePdfFile = null
+        _pageBitmap.value = null
+        _textBlocks.value = emptyList()
+        _pendingEdits.value = emptyMap()
+        _selectedBlock.value = null
+        _totalPages.value = 0
+        _currentPage.value = 0
+        _loadState.value = PdfLoadState.Idle
+    }
+
+    fun saveEditsToDestination(outputStream: OutputStream, onSuccess: () -> Unit) {
+        if (activePdfFile == null) return
+        if (_pendingEdits.value.isEmpty()) {
+            _statusMessage.value = "Henüz bir değişiklik yapılmadı."
+            return
+        }
+
+        viewModelScope.launch {
+            _isSaving.value = true
+            val outFile = File(getApplication<Application>().cacheDir, "IntactPDF_Export_${System.currentTimeMillis()}.pdf")
+            val result = engine.applyEdits(_pendingEdits.value.values.toList(), outFile)
+            _isSaving.value = false
+
+            result.onSuccess { savedFile ->
+                try {
+                    savedFile.inputStream().use { input ->
+                        input.copyTo(outputStream)
+                    }
+                    _statusMessage.value = "PDF başarıyla kaydedildi!"
+                    openFile(savedFile, savedFile.name)
+                    onSuccess()
+                } catch (e: Exception) {
+                    _statusMessage.value = "Dosya yazma hatası: ${e.message}"
+                }
+            }.onFailure { err ->
+                _statusMessage.value = "Kayıt hatası: ${err.message}"
+            }
+        }
     }
 
     fun saveEdits(onSaved: (File) -> Unit) {
@@ -140,8 +187,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             _isSaving.value = false
 
             result.onSuccess { savedFile ->
-                _statusMessage.value = "Değişiklikler kaydedildi! Sayfa yapısı korundu."
-                // Reopen the saved file to show updated state
+                _statusMessage.value = "Değişiklikler kaydedildi!"
                 openFile(savedFile, savedFile.name)
                 onSaved(savedFile)
             }.onFailure { err ->

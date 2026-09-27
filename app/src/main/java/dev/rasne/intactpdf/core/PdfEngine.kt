@@ -9,13 +9,14 @@ import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
 import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
+import com.tom_roush.pdfbox.pdmodel.font.PDFont
+import com.tom_roush.pdfbox.pdmodel.font.PDType0Font
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import dev.rasne.intactpdf.model.PdfTextBlock
 import dev.rasne.intactpdf.model.TextEditOperation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 
 class PdfEngine(private val context: Context) {
 
@@ -58,17 +59,54 @@ class PdfEngine(private val context: Context) {
     }
 
     /**
+     * Resolves the best available font supporting Unicode / Turkish characters.
+     */
+    private fun resolveFont(doc: PDDocument): Pair<PDFont, Boolean> {
+        val candidateFontPaths = listOf(
+            "/system/fonts/Roboto-Regular.ttf",
+            "/system/fonts/NotoSans-Regular.ttf",
+            "/system/fonts/DroidSans.ttf"
+        )
+
+        for (path in candidateFontPaths) {
+            val f = File(path)
+            if (f.exists() && f.canRead()) {
+                try {
+                    val font = PDType0Font.load(doc, f)
+                    return Pair(font, true)
+                } catch (_: Exception) {
+                    // Try next font candidate
+                }
+            }
+        }
+
+        // Fallback to standard Type 1 Helvetica font
+        return Pair(PDType1Font.HELVETICA, false)
+    }
+
+    private fun sanitizeForType1(text: String): String {
+        return text
+            .replace('ı', 'i').replace('İ', 'I')
+            .replace('ş', 's').replace('Ş', 'S')
+            .replace('ğ', 'g').replace('Ğ', 'G')
+            .replace('ç', 'c').replace('Ç', 'C')
+            .replace('ö', 'o').replace('Ö', 'O')
+            .replace('ü', 'u').replace('Ü', 'U')
+    }
+
+    /**
      * Applies layout-preserving text modifications.
-     * Original text bounding box is covered, and new text is constrained strictly within bounds.
+     * Original text bounding box is covered with clean white, and new text is constrained strictly within bounds.
      */
     suspend fun applyEdits(
         operations: List<TextEditOperation>,
         outputFile: File
     ): Result<File> = withContext(Dispatchers.IO) {
-        val srcFile = currentFile ?: return@withContext Result.failure(IllegalStateException("No document loaded"))
+        val srcFile = currentFile ?: return@withContext Result.failure(IllegalStateException("Açık belge bulunamadı."))
 
         try {
             val doc = PDDocument.load(srcFile)
+            val (font, isUnicodeFont) = resolveFont(doc)
             val editsByPage = operations.groupBy { it.targetBlock.pageIndex }
 
             for ((pageIdx, edits) in editsByPage) {
@@ -76,7 +114,6 @@ class PdfEngine(private val context: Context) {
                 val page = doc.getPage(pageIdx)
                 val pageHeight = page.mediaBox.height
 
-                // Append mode to overlay on top of existing elements
                 val contentStream = PDPageContentStream(
                     doc,
                     page,
@@ -89,43 +126,53 @@ class PdfEngine(private val context: Context) {
                     val bounds = op.targetBlock.pdfBounds
 
                     // 1. Redact / White-out the exact bounding box so layout remains completely intact
-                    contentStream.setNonStrokingColor(1f, 1f, 1f) // Clean white
-                    // In PDF coordinate space, Y=0 is bottom-left
+                    contentStream.setNonStrokingColor(1f, 1f, 1f)
                     val pdfY = pageHeight - bounds.bottom
                     val boxHeight = bounds.height()
                     val boxWidth = bounds.width()
 
-                    // Expand rect slightly (0.5pt) to avoid any edge bleeding of original text
+                    // Expand rect slightly (1pt) to completely conceal original text
                     contentStream.addRect(
-                        bounds.left - 0.5f,
-                        pdfY - 0.5f,
-                        boxWidth + 1f,
-                        boxHeight + 1f
+                        bounds.left - 1f,
+                        pdfY - 1f,
+                        boxWidth + 2f,
+                        boxHeight + 2f
                     )
                     contentStream.fill()
 
-                    // 2. If it's a replacement (not just deletion/removal), write the new text
+                    // 2. If it's a replacement (not deletion), render the new text
                     if (!op.isRemoved && op.newText.isNotBlank()) {
-                        val font = PDType1Font.HELVETICA
+                        var textToWrite = if (isUnicodeFont) op.newText else sanitizeForType1(op.newText)
                         var targetFontSize = op.targetBlock.fontSize
                         if (targetFontSize <= 0f) targetFontSize = 12f
 
-                        // Calculate text width with standard font
-                        var textWidth = font.getStringWidth(op.newText) / 1000f * targetFontSize
+                        // Calculate text width safely
+                        var textWidth = try {
+                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                        } catch (e: Exception) {
+                            // If encoding error occurs, sanitize text and recalculate
+                            textToWrite = sanitizeForType1(textToWrite)
+                            font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                        }
 
                         // If user input is longer than original slot, scale down font proportionately
                         // to guarantee ZERO layout shifting of surrounding lines!
                         if (textWidth > boxWidth && boxWidth > 1f) {
-                            val ratio = boxWidth / textWidth
+                            val ratio = (boxWidth / textWidth).coerceIn(0.4f, 1f)
                             targetFontSize *= ratio
+                        }
+
+                        val targetY = if (op.targetBlock.baselineY > 0f) {
+                            pageHeight - op.targetBlock.baselineY
+                        } else {
+                            pdfY + (boxHeight * 0.15f)
                         }
 
                         contentStream.beginText()
                         contentStream.setFont(font, targetFontSize)
-                        contentStream.setNonStrokingColor(0f, 0f, 0f) // Black text
-                        // Position at baseline
-                        contentStream.newLineAtOffset(bounds.left, pdfY + (boxHeight * 0.15f))
-                        contentStream.showText(op.newText)
+                        contentStream.setNonStrokingColor(0f, 0f, 0f)
+                        contentStream.newLineAtOffset(bounds.left, targetY)
+                        contentStream.showText(textToWrite)
                         contentStream.endText()
                     }
                 }
@@ -143,8 +190,7 @@ class PdfEngine(private val context: Context) {
     }
 
     /**
-     * Creates a sample test PDF document so users can instantly test editing
-     * without needing to find or transfer a PDF to their device.
+     * Creates a sample test PDF document so users can instantly test editing.
      */
     suspend fun createSamplePdf(targetFile: File): File = withContext(Dispatchers.IO) {
         val document = PDDocument()
@@ -157,7 +203,7 @@ class PdfEngine(private val context: Context) {
         contentStream.beginText()
         contentStream.setFont(PDType1Font.HELVETICA_BOLD, 22f)
         contentStream.newLineAtOffset(50f, 750f)
-        contentStream.showText("IntactPDF Sample Document")
+        contentStream.showText("IntactPDF Ornek Belge")
         contentStream.endText()
 
         // Subtitle
@@ -165,7 +211,7 @@ class PdfEngine(private val context: Context) {
         contentStream.setFont(PDType1Font.HELVETICA, 13f)
         contentStream.setNonStrokingColor(0.2f, 0.4f, 0.8f)
         contentStream.newLineAtOffset(50f, 720f)
-        contentStream.showText("100% Offline, Ad-Free & Layout-Preserving Editor")
+        contentStream.showText("Sayfa Duzenini Koruyan PDF Duzenleyici")
         contentStream.endText()
 
         // Horizontal separator line
@@ -180,21 +226,21 @@ class PdfEngine(private val context: Context) {
         contentStream.setFont(PDType1Font.HELVETICA, 12f)
         contentStream.setNonStrokingColor(0f, 0f, 0f)
         contentStream.newLineAtOffset(50f, 660f)
-        contentStream.showText("This is a test paragraph designed to test in-place editing.")
+        contentStream.showText("Bu metin uzerine dokunarak dogrudan degistirebilirsiniz.")
         contentStream.endText()
 
         // Paragraph 2
         contentStream.beginText()
         contentStream.setFont(PDType1Font.HELVETICA, 12f)
         contentStream.newLineAtOffset(50f, 630f)
-        contentStream.showText("You can tap any word or line to edit or remove it cleanly.")
+        contentStream.showText("Duzenleme sonrasinda sayfa duzeni ve satir yapisi bozulmaz.")
         contentStream.endText()
 
         // Paragraph 3 (Highlighted sample)
         contentStream.beginText()
         contentStream.setFont(PDType1Font.HELVETICA_BOLD, 12f)
         contentStream.newLineAtOffset(50f, 600f)
-        contentStream.showText("Notice how surrounding sentences stay perfectly aligned.")
+        contentStream.showText("Istediginiz metni silebilir veya yerine yeni metin yazabilirsiniz.")
         contentStream.endText()
 
         // Paragraph 4
@@ -202,7 +248,7 @@ class PdfEngine(private val context: Context) {
         contentStream.setFont(PDType1Font.HELVETICA_OBLIQUE, 11f)
         contentStream.setNonStrokingColor(0.4f, 0.4f, 0.4f)
         contentStream.newLineAtOffset(50f, 550f)
-        contentStream.showText("IntactPDF does not have internet permission. Your data is 100% private.")
+        contentStream.showText("Kaydet butonuna basarak duzenlenmis PDF belgenizi disa aktarabilirsiniz.")
         contentStream.endText()
 
         contentStream.close()

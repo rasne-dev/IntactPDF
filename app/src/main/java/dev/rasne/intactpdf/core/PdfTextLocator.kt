@@ -27,37 +27,37 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
         pageWidth = mediaBox.width
         pageHeight = mediaBox.height
 
-        // Process text and collect positions
         val dummy = StringWriter()
         writeText(document, dummy)
 
-        return assembleLines(collectedPositions)
+        return assembleBlocks(collectedPositions)
     }
 
     override fun processTextPosition(text: TextPosition) {
         val unicode = text.unicode
-        if (unicode != null && unicode.isNotBlank()) {
+        if (unicode != null && unicode.isNotEmpty()) {
             collectedPositions.add(text)
         }
     }
 
-    private fun assembleLines(positions: List<TextPosition>): List<PdfTextBlock> {
+    private fun assembleBlocks(positions: List<TextPosition>): List<PdfTextBlock> {
         if (positions.isEmpty()) return emptyList()
 
         val blocks = mutableListOf<PdfTextBlock>()
-        var currentWord = StringBuilder()
+        var currentText = StringBuilder()
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
         var maxX = Float.MIN_VALUE
         var maxY = Float.MIN_VALUE
         var currentFontSize = 12f
+        var currentBaselineY = 0f
 
         var lastPos: TextPosition? = null
 
-        fun flushWord() {
-            if (currentWord.isNotEmpty() && minX < maxX && minY < maxY) {
+        fun flushBlock() {
+            val textStr = currentText.toString().trim()
+            if (textStr.isNotEmpty() && minX < maxX && minY < maxY) {
                 val pdfRect = RectF(minX, minY, maxX, maxY)
-                // Normalize to [0..1] range based on page dimensions
                 val normRect = RectF(
                     (minX / pageWidth).coerceIn(0f, 1f),
                     (minY / pageHeight).coerceIn(0f, 1f),
@@ -68,19 +68,21 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
                 blocks.add(
                     PdfTextBlock(
                         id = UUID.randomUUID().toString(),
-                        text = currentWord.toString(),
+                        text = textStr,
                         pageIndex = targetPageIndex,
                         normalizedBounds = normRect,
                         pdfBounds = pdfRect,
-                        fontSize = currentFontSize
+                        fontSize = currentFontSize,
+                        baselineY = currentBaselineY
                     )
                 )
-                currentWord.clear()
-                minX = Float.MAX_VALUE
-                minY = Float.MAX_VALUE
-                maxX = Float.MIN_VALUE
-                maxY = Float.MIN_VALUE
             }
+            currentText.clear()
+            minX = Float.MAX_VALUE
+            minY = Float.MAX_VALUE
+            maxX = Float.MIN_VALUE
+            maxY = Float.MIN_VALUE
+            lastPos = null
         }
 
         for (pos in positions) {
@@ -89,24 +91,41 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
             val pw = pos.widthDirAdj
             val ph = pos.heightDir
 
-            val isSameLine = lastPos == null || Math.abs(pos.yDirAdj - lastPos.yDirAdj) < (pos.heightDir * 0.7f)
-            val isContinuous = lastPos == null || (px - (lastPos.xDirAdj + lastPos.widthDirAdj)) < (pos.widthDirAdj * 1.5f)
+            if (lastPos != null) {
+                val lineDeltaY = Math.abs(pos.yDirAdj - lastPos!!.yDirAdj)
+                val isSameLine = lineDeltaY < (Math.max(pos.heightDir, lastPos!!.heightDir) * 0.6f)
+                val gap = px - (lastPos!!.xDirAdj + lastPos!!.widthDirAdj)
 
-            if (!isSameLine || !isContinuous) {
-                flushWord()
+                if (!isSameLine) {
+                    // New line encountered
+                    flushBlock()
+                } else if (gap > (pos.widthDirAdj * 3.5f)) {
+                    // Large horizontal gap (different column or tab stop)
+                    flushBlock()
+                } else if (gap > (pos.widthDirAdj * 0.25f) && !currentText.endsWith(" ")) {
+                    // Normal space between words
+                    currentText.append(" ")
+                }
             }
 
-            currentWord.append(pos.unicode)
-            currentFontSize = pos.fontSizeInPt
-            minX = minOf(minX, px)
-            minY = minOf(minY, py - ph)
-            maxX = maxOf(maxX, px + pw)
-            maxY = maxOf(maxY, py + (ph * 0.2f))
+            if (pos.unicode == " ") {
+                if (currentText.isNotEmpty() && !currentText.endsWith(" ")) {
+                    currentText.append(" ")
+                }
+            } else {
+                currentText.append(pos.unicode)
+                currentFontSize = pos.fontSizeInPt
+                currentBaselineY = py
+                minX = minOf(minX, px)
+                minY = minOf(minY, py - ph)
+                maxX = maxOf(maxX, px + pw)
+                maxY = maxOf(maxY, py + (ph * 0.2f))
+            }
 
             lastPos = pos
         }
 
-        flushWord()
+        flushBlock()
         return blocks
     }
 }
