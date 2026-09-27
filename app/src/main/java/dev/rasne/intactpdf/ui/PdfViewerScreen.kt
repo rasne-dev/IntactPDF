@@ -2,18 +2,21 @@ package dev.rasne.intactpdf.ui
 
 import android.content.Intent
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -52,16 +55,18 @@ fun PdfViewerScreen(
     val statusMessage by viewModel.statusMessage.collectAsState()
 
     var showTextListSheet by remember { mutableStateOf(false) }
-    var showSaveOptionsDialog by remember { mutableStateOf(false) }
 
-    // File Open Launcher
+    // Handle system back press: close document → go home
+    BackHandler(enabled = viewModel.isDocumentOpen()) {
+        viewModel.closeDocument()
+    }
+
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         uri?.let { viewModel.openFromUri(it) }
     }
 
-    // Save to Device Launcher
     val saveFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destinationUri ->
@@ -84,6 +89,8 @@ fun PdfViewerScreen(
             viewModel.clearStatusMessage()
         }
     }
+
+    val bgColor = MaterialTheme.colorScheme.surfaceContainerLow
 
     Scaffold(
         topBar = {
@@ -110,7 +117,11 @@ fun PdfViewerScreen(
                         )
                         if (loadState is PdfLoadState.Success) {
                             Text(
-                                text = if (viewerMode == ViewerMode.EDIT) "Düzenleme Modu • Sayfa ${currentPage + 1} / $totalPages" else "Görüntüleme Modu • Sayfa ${currentPage + 1} / $totalPages",
+                                text = if (viewerMode == ViewerMode.EDIT) {
+                                    "Düzenleme Modu"
+                                } else {
+                                    "Sayfa ${currentPage + 1} / $totalPages"
+                                },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (viewerMode == ViewerMode.EDIT) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -119,14 +130,14 @@ fun PdfViewerScreen(
                 },
                 actions = {
                     if (loadState is PdfLoadState.Success) {
-                        // Undo Action
-                        if (canUndo) {
+                        // Undo
+                        AnimatedVisibility(visible = canUndo) {
                             IconButton(onClick = { viewModel.undoLastEdit() }) {
                                 Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Geri Al")
                             }
                         }
 
-                        // Toggle View / Edit Mode
+                        // Toggle Mode button
                         FilledTonalButton(
                             onClick = { viewModel.toggleViewerMode() },
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
@@ -144,29 +155,77 @@ fun PdfViewerScreen(
                                 contentDescription = null,
                                 modifier = Modifier.size(16.dp)
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
                             Text(
-                                text = if (viewerMode == ViewerMode.EDIT) "Görüntüle" else "Düzenle",
-                                fontSize = 13.sp,
+                                text = if (viewerMode == ViewerMode.EDIT) "Oku" else "Düzenle",
+                                fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
 
-                        // Text List (only in Edit mode or accessible)
-                        if (viewerMode == ViewerMode.EDIT) {
-                            IconButton(onClick = { showTextListSheet = true }) {
-                                Icon(Icons.Default.List, contentDescription = "Sayfadaki Metinler")
-                            }
+                        // Open File
+                        IconButton(onClick = { filePicker.launch(arrayOf("application/pdf")) }) {
+                            Icon(Icons.Default.FolderOpen, contentDescription = "PDF Aç")
                         }
 
-                        // Save Button
-                        IconButton(onClick = { showSaveOptionsDialog = true }) {
-                            if (editCount > 0) {
-                                BadgedBox(badge = { Badge { Text("$editCount") } }) {
-                                    Icon(Icons.Default.Save, contentDescription = "Kaydet")
+                        // Overflow Menu
+                        var menuExpanded by remember { mutableStateOf(false) }
+                        Box {
+                            IconButton(onClick = { menuExpanded = true }) {
+                                if (editCount > 0) {
+                                    BadgedBox(badge = { Badge { Text("$editCount") } }) {
+                                        Icon(Icons.Default.MoreVert, contentDescription = "Daha Fazla")
+                                    }
+                                } else {
+                                    Icon(Icons.Default.MoreVert, contentDescription = "Daha Fazla")
                                 }
-                            } else {
-                                Icon(Icons.Default.Save, contentDescription = "Kaydet")
+                            }
+                            DropdownMenu(
+                                expanded = menuExpanded,
+                                onDismissRequest = { menuExpanded = false }
+                            ) {
+                                if (viewerMode == ViewerMode.EDIT) {
+                                    DropdownMenuItem(
+                                        text = { Text("Sayfadaki Metinler") },
+                                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) },
+                                        onClick = {
+                                            menuExpanded = false
+                                            showTextListSheet = true
+                                        }
+                                    )
+                                }
+                                DropdownMenuItem(
+                                    text = { Text("Cihaza Kaydet") },
+                                    leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        val name = "Duzenlenen_${System.currentTimeMillis()}.pdf"
+                                        saveFileLauncher.launch(name)
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Paylaş") },
+                                    leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        val shareFile = viewModel.getWorkingFileForSharing()
+                                        if (shareFile != null && shareFile.exists()) {
+                                            val uri = FileProvider.getUriForFile(
+                                                context,
+                                                "${context.packageName}.fileprovider",
+                                                shareFile
+                                            )
+                                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                                type = "application/pdf"
+                                                putExtra(Intent.EXTRA_STREAM, uri)
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                            context.startActivity(Intent.createChooser(shareIntent, "PDF Paylaş"))
+                                        } else {
+                                            Toast.makeText(context, "Paylaşılacak dosya bulunamadı.", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                )
                             }
                         }
                     } else {
@@ -182,37 +241,32 @@ fun PdfViewerScreen(
         },
         bottomBar = {
             if (loadState is PdfLoadState.Success && totalPages > 1) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 4.dp
+                NavigationBar(
+                    tonalElevation = 2.dp
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .navigationBarsPadding()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    IconButton(
+                        onClick = { viewModel.setPage(currentPage - 1) },
+                        enabled = currentPage > 0,
+                        modifier = Modifier.weight(1f)
                     ) {
-                        IconButton(
-                            onClick = { viewModel.setPage(currentPage - 1) },
-                            enabled = currentPage > 0
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Önceki Sayfa")
-                        }
+                        Icon(Icons.Default.ChevronLeft, contentDescription = "Önceki Sayfa")
+                    }
 
-                        Text(
-                            text = "${currentPage + 1} / $totalPages",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
+                    Text(
+                        text = "${currentPage + 1} / $totalPages",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .align(Alignment.CenterVertically)
+                            .padding(horizontal = 16.dp)
+                    )
 
-                        IconButton(
-                            onClick = { viewModel.setPage(currentPage + 1) },
-                            enabled = currentPage < totalPages - 1
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Sonraki Sayfa")
-                        }
+                    IconButton(
+                        onClick = { viewModel.setPage(currentPage + 1) },
+                        enabled = currentPage < totalPages - 1,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.ChevronRight, contentDescription = "Sonraki Sayfa")
                     }
                 }
             }
@@ -222,7 +276,7 @@ fun PdfViewerScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .background(Color(0xFFF2F4F7)),
+                .background(bgColor),
             contentAlignment = Alignment.Center
         ) {
             when (val state = loadState) {
@@ -247,7 +301,7 @@ fun PdfViewerScreen(
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(16.dp),
-                        modifier = Modifier.padding(24.dp)
+                        modifier = Modifier.padding(32.dp)
                     ) {
                         Icon(
                             Icons.Default.ErrorOutline,
@@ -275,7 +329,7 @@ fun PdfViewerScreen(
                 is PdfLoadState.Success -> {
                     Column(modifier = Modifier.fillMaxSize()) {
                         // Edit Mode Hint Banner
-                        if (viewerMode == ViewerMode.EDIT) {
+                        AnimatedVisibility(visible = viewerMode == ViewerMode.EDIT) {
                             Surface(
                                 color = MaterialTheme.colorScheme.primaryContainer,
                                 modifier = Modifier.fillMaxWidth()
@@ -295,7 +349,7 @@ fun PdfViewerScreen(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "Düzenlemek veya silmek istediğiniz metne dokunun.",
+                                        text = "Düzenlemek veya silmek istediğiniz metne dokunun",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                                         fontWeight = FontWeight.Medium
@@ -320,6 +374,7 @@ fun PdfViewerScreen(
                 }
             }
 
+            // Saving overlay
             if (isSaving) {
                 Surface(
                     color = Color.Black.copy(alpha = 0.5f),
@@ -327,7 +382,7 @@ fun PdfViewerScreen(
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Card(
-                            shape = RoundedCornerShape(12.dp),
+                            shape = RoundedCornerShape(16.dp),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                         ) {
                             Row(
@@ -345,7 +400,7 @@ fun PdfViewerScreen(
         }
     }
 
-    // Text Edit Modal Dialog
+    // Text Edit Dialog
     selectedBlock?.let { block ->
         TextEditDialog(
             block = block,
@@ -356,7 +411,7 @@ fun PdfViewerScreen(
         )
     }
 
-    // Modal Bottom Sheet for Listing Page Text Blocks
+    // Text List Bottom Sheet
     if (showTextListSheet) {
         ModalBottomSheet(
             onDismissRequest = { showTextListSheet = false }
@@ -385,12 +440,12 @@ fun PdfViewerScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(max = 420.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(textBlocks) { block ->
                             Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                                shape = RoundedCornerShape(10.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
@@ -400,8 +455,7 @@ fun PdfViewerScreen(
                             ) {
                                 Row(
                                     modifier = Modifier.padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text(
                                         text = block.text,
@@ -410,6 +464,7 @@ fun PdfViewerScreen(
                                         overflow = TextOverflow.Ellipsis,
                                         modifier = Modifier.weight(1f)
                                     )
+                                    Spacer(modifier = Modifier.width(8.dp))
                                     Icon(
                                         Icons.Default.Edit,
                                         contentDescription = "Düzenle",
@@ -425,55 +480,6 @@ fun PdfViewerScreen(
             }
         }
     }
-
-    // Save Options Dialog
-    if (showSaveOptionsDialog) {
-        AlertDialog(
-            onDismissRequest = { showSaveOptionsDialog = false },
-            title = { Text("Kaydetme Seçenekleri") },
-            text = { Text("PDF belgenizi nasıl kaydetmek veya paylaşmak istersiniz?") },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showSaveOptionsDialog = false
-                        val exportFileName = "Duzenlenen_${System.currentTimeMillis()}.pdf"
-                        saveFileLauncher.launch(exportFileName)
-                    }
-                ) {
-                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Cihaza Kaydet")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(
-                    onClick = {
-                        showSaveOptionsDialog = false
-                        val shareFile = viewModel.getWorkingFileForSharing()
-                        if (shareFile != null && shareFile.exists()) {
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                shareFile
-                            )
-                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                type = "application/pdf"
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            context.startActivity(Intent.createChooser(shareIntent, "PDF Paylaş"))
-                        } else {
-                            Toast.makeText(context, "Paylaşılacak dosya bulunamadı.", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) {
-                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Paylaş")
-                }
-            }
-        )
-    }
 }
 
 @Composable
@@ -484,26 +490,26 @@ private fun WelcomeHomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(24.dp),
+            .padding(28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
         Surface(
             shape = CircleShape,
             color = MaterialTheme.colorScheme.primaryContainer,
-            modifier = Modifier.size(76.dp)
+            modifier = Modifier.size(80.dp)
         ) {
             Box(contentAlignment = Alignment.Center) {
                 Icon(
                     imageVector = Icons.Default.Description,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.size(38.dp)
+                    modifier = Modifier.size(40.dp)
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(18.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
         Text(
             text = "IntactPDF",
@@ -514,21 +520,21 @@ private fun WelcomeHomeScreen(
         Spacer(modifier = Modifier.height(6.dp))
 
         Text(
-            text = "Sayfa düzenini bozmadan PDF metinlerini doğrudan düzenleyin.",
+            text = "Sayfa düzenini bozmadan PDF metinlerini düzenleyin.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
-            modifier = Modifier.padding(horizontal = 16.dp)
+            modifier = Modifier.padding(horizontal = 12.dp)
         )
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(36.dp))
 
         Button(
             onClick = onOpenFile,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(52.dp),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(14.dp)
         ) {
             Icon(Icons.Default.FolderOpen, contentDescription = null)
             Spacer(modifier = Modifier.width(10.dp))
@@ -542,35 +548,35 @@ private fun WelcomeHomeScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(48.dp),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(14.dp)
         ) {
             Icon(Icons.Default.AutoStories, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             Text("Örnek Belgeyi İncele", fontSize = 15.sp)
         }
 
-        Spacer(modifier = Modifier.height(36.dp))
+        Spacer(modifier = Modifier.height(32.dp))
 
         Card(
-            shape = RoundedCornerShape(12.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 FeatureRow(
                     icon = Icons.Default.Visibility,
-                    text = "Görüntüleme ve Düzenleme modları arasında kolayca geçiş yapın."
+                    text = "Görüntüleme ve Düzenleme modları arasında geçiş yapın"
                 )
                 FeatureRow(
                     icon = Icons.Default.TouchApp,
-                    text = "Düzenleme modunda metinlere dokunarak doğrudan düzenleyin veya silin."
+                    text = "Düzenleme modunda metinlere dokunarak silin veya değiştirin"
                 )
                 FeatureRow(
                     icon = Icons.Default.SaveAlt,
-                    text = "Değişiklikleri yeni PDF olarak kaydedin veya paylaşın."
+                    text = "Değişiklikleri yeni PDF olarak kaydedin veya paylaşın"
                 )
             }
         }

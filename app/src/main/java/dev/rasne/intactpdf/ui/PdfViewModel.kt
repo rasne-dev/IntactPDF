@@ -20,6 +20,11 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 
+private data class UndoSnapshot(
+    val file: File,
+    val blocksMap: Map<Int, List<PdfTextBlock>>
+)
+
 class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     private val engine = PdfEngine(application)
@@ -58,11 +63,9 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
     private var workingFile: File? = null
-    private val undoHistory = mutableListOf<File>()
-
-    fun setViewerMode(mode: ViewerMode) {
-        _viewerMode.value = mode
-    }
+    private var documentTitle: String = ""
+    private val undoHistory = mutableListOf<UndoSnapshot>()
+    private val pageBlocksCache = mutableMapOf<Int, MutableList<PdfTextBlock>>()
 
     fun toggleViewerMode() {
         _viewerMode.value = if (_viewerMode.value == ViewerMode.VIEW) ViewerMode.EDIT else ViewerMode.VIEW
@@ -87,12 +90,26 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val context = getApplication<Application>()
                 val tempFile = File(context.cacheDir, "opened_doc_${System.currentTimeMillis()}.pdf")
-                context.contentResolver.openInputStream(uri)?.use { input ->
+
+                val inputStream = context.contentResolver.openInputStream(uri)
+                if (inputStream == null) {
+                    _loadState.value = PdfLoadState.Error("Dosya okunamadı. Lütfen farklı bir dosya deneyin.")
+                    return@launch
+                }
+
+                inputStream.use { input ->
                     FileOutputStream(tempFile).use { output ->
                         input.copyTo(output)
                     }
                 }
-                val displayName = uri.lastPathSegment ?: "Belge.pdf"
+
+                if (tempFile.length() == 0L) {
+                    tempFile.delete()
+                    _loadState.value = PdfLoadState.Error("Dosya boş. Lütfen geçerli bir PDF seçin.")
+                    return@launch
+                }
+
+                val displayName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Belge"
                 openFile(tempFile, displayName)
             } catch (e: Exception) {
                 _loadState.value = PdfLoadState.Error("Dosya açılamadı: ${e.message}")
@@ -102,19 +119,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun openFile(sourceFile: File, title: String) {
         val context = getApplication<Application>()
-        // Create an isolated working copy for editing
         val workFile = File(context.cacheDir, "intact_work_${System.currentTimeMillis()}.pdf")
         sourceFile.copyTo(workFile, overwrite = true)
         workingFile = workFile
+        documentTitle = title
 
-        // Clear undo history
+        pageBlocksCache.clear()
         clearUndoHistory()
 
         val count = engine.openFile(workFile)
+        if (count == 0) {
+            _loadState.value = PdfLoadState.Error("PDF dosyası okunamadı veya sayfa bulunamadı.")
+            return
+        }
+
         _totalPages.value = count
         _currentPage.value = 0
         _editCount.value = 0
-        _viewerMode.value = ViewerMode.VIEW // Always start in clean View mode!
+        _viewerMode.value = ViewerMode.VIEW
         _loadState.value = PdfLoadState.Success(count, title)
         loadPageData(0)
     }
@@ -122,8 +144,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun loadPageData(pageIndex: Int) {
         val bitmap = engine.renderPage(pageIndex)
         _pageBitmap.value = bitmap
-        val blocks = engine.extractTextBlocks(pageIndex, workingFile)
-        _textBlocks.value = blocks
+
+        val blocks = pageBlocksCache.getOrPut(pageIndex) {
+            engine.extractTextBlocks(pageIndex, workingFile).toMutableList()
+        }
+        _textBlocks.value = blocks.toList()
     }
 
     fun setPage(pageIndex: Int) {
@@ -140,11 +165,37 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyEdit(block: PdfTextBlock, newText: String, isRemoved: Boolean) {
+        // Skip if nothing changed
+        if (!isRemoved && newText == block.text) {
+            _selectedBlock.value = null
+            return
+        }
+
         val activeWorkFile = workingFile ?: return
+        val pageIndex = block.pageIndex
 
         viewModelScope.launch {
-            // Push snapshot to undo history
+            // Ensure the page blocks are loaded in cache before snapshotting
+            if (!pageBlocksCache.containsKey(pageIndex)) {
+                pageBlocksCache[pageIndex] = engine.extractTextBlocks(pageIndex, activeWorkFile).toMutableList()
+            }
+
+            // Push snapshot for undo
             pushUndoSnapshot(activeWorkFile)
+
+            // Update blocks cache immediately so the bounding box disappears/updates instantly
+            val currentList = pageBlocksCache[pageIndex] ?: mutableListOf()
+            if (isRemoved) {
+                currentList.removeAll { it.id == block.id }
+            } else {
+                val idx = currentList.indexOfFirst { it.id == block.id }
+                if (idx != -1) {
+                    currentList[idx] = block.copy(text = newText)
+                }
+            }
+            pageBlocksCache[pageIndex] = currentList
+            _textBlocks.value = currentList.toList()
+            _selectedBlock.value = null
 
             val op = TextEditOperation(
                 targetBlock = block,
@@ -153,14 +204,23 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             val result = engine.applyEditLive(op, activeWorkFile)
-            _selectedBlock.value = null
 
             result.onSuccess {
                 _editCount.value = _editCount.value + 1
                 _canUndo.value = undoHistory.isNotEmpty()
-                loadPageData(_currentPage.value)
+                // Re-render ONLY the bitmap, keeping the updated blocks list
+                val updatedBitmap = engine.renderPage(pageIndex)
+                _pageBitmap.value = updatedBitmap
                 _statusMessage.value = if (isRemoved) "Metin silindi" else "Metin güncellendi"
             }.onFailure { err ->
+                // Roll back snapshot on failure
+                if (undoHistory.isNotEmpty()) {
+                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
+                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
+                    _canUndo.value = undoHistory.isNotEmpty()
+                    pageBlocksCache.remove(pageIndex)
+                    loadPageData(pageIndex)
+                }
                 _statusMessage.value = "Düzenleme hatası: ${err.message}"
             }
         }
@@ -176,13 +236,20 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             _editCount.value = (_editCount.value - 1).coerceAtLeast(0)
 
             withContext(Dispatchers.IO) {
-                lastSnapshot.copyTo(activeWorkFile, overwrite = true)
-                lastSnapshot.delete()
+                lastSnapshot.file.copyTo(activeWorkFile, overwrite = true)
+                lastSnapshot.file.delete()
                 engine.openFile(activeWorkFile)
             }
 
-            loadPageData(_currentPage.value)
-            _statusMessage.value = "Son işlem geri alındı"
+            // Restore blocks cache
+            pageBlocksCache.clear()
+            lastSnapshot.blocksMap.forEach { (page, list) ->
+                pageBlocksCache[page] = list.map { it.copy() }.toMutableList()
+            }
+
+            _textBlocks.value = pageBlocksCache[_currentPage.value]?.toList() ?: emptyList()
+            _pageBitmap.value = engine.renderPage(_currentPage.value)
+            _statusMessage.value = "Geri alındı"
         }
     }
 
@@ -190,24 +257,39 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         try {
             val snapshot = File(getApplication<Application>().cacheDir, "undo_${System.currentTimeMillis()}.pdf")
             currentFile.copyTo(snapshot, overwrite = true)
-            undoHistory.add(snapshot)
+
+            val blocksCopy = pageBlocksCache.mapValues { (_, list) ->
+                list.map { it.copy() }
+            }
+            undoHistory.add(UndoSnapshot(snapshot, blocksCopy))
             _canUndo.value = true
+
+            // Limit undo history to 20 steps to prevent excessive disk usage
+            while (undoHistory.size > 20) {
+                val oldest = undoHistory.removeAt(0)
+                try { oldest.file.delete() } catch (_: Exception) {}
+            }
         } catch (_: Exception) {}
     }
 
     private fun clearUndoHistory() {
-        for (f in undoHistory) {
-            try { f.delete() } catch (_: Exception) {}
+        for (s in undoHistory) {
+            try { s.file.delete() } catch (_: Exception) {}
         }
         undoHistory.clear()
         _canUndo.value = false
     }
 
+    /** Returns true if a document is currently open (for back press handling) */
+    fun isDocumentOpen(): Boolean = _loadState.value is PdfLoadState.Success
+
     fun closeDocument() {
         engine.close()
         clearUndoHistory()
+        pageBlocksCache.clear()
         workingFile?.let { try { it.delete() } catch (_: Exception) {} }
         workingFile = null
+        documentTitle = ""
         _pageBitmap.value = null
         _textBlocks.value = emptyList()
         _selectedBlock.value = null
@@ -223,18 +305,22 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _isSaving.value = true
+            var success = false
             withContext(Dispatchers.IO) {
                 try {
                     activeWorkFile.inputStream().use { input ->
                         input.copyTo(outputStream)
                     }
+                    success = true
                 } catch (e: Exception) {
                     _statusMessage.value = "Dosya kaydetme hatası: ${e.message}"
                 }
             }
             _isSaving.value = false
-            _statusMessage.value = "PDF başarıyla kaydedildi!"
-            onSuccess()
+            if (success) {
+                _statusMessage.value = "PDF başarıyla kaydedildi!"
+                onSuccess()
+            }
         }
     }
 

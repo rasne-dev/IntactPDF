@@ -15,6 +15,8 @@ import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import dev.rasne.intactpdf.model.PdfTextBlock
 import dev.rasne.intactpdf.model.TextEditOperation
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -24,11 +26,16 @@ class PdfEngine(private val context: Context) {
     private var pfd: ParcelFileDescriptor? = null
     private var nativeRenderer: PdfRenderer? = null
 
+    // Mutex to prevent concurrent PdfRenderer access (Android requires single-threaded usage)
+    private val rendererMutex = Mutex()
+
     suspend fun openFile(file: File): Int = withContext(Dispatchers.IO) {
-        close()
-        currentFile = file
-        openRendererHandles(file)
-        return@withContext nativeRenderer?.pageCount ?: 0
+        rendererMutex.withLock {
+            closeInternal()
+            currentFile = file
+            openRendererHandles(file)
+            return@withContext nativeRenderer?.pageCount ?: 0
+        }
     }
 
     private fun openRendererHandles(file: File) {
@@ -49,24 +56,25 @@ class PdfEngine(private val context: Context) {
         pfd = null
     }
 
-    suspend fun reloadRenderer() = withContext(Dispatchers.IO) {
-        currentFile?.let { openRendererHandles(it) }
-    }
-
     suspend fun renderPage(pageIndex: Int, densityMultiplier: Float = 2.0f): Bitmap? = withContext(Dispatchers.IO) {
-        val renderer = nativeRenderer ?: return@withContext null
-        if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
+        rendererMutex.withLock {
+            val renderer = nativeRenderer ?: return@withContext null
+            if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
 
-        val page = renderer.openPage(pageIndex)
-        val width = (page.width * densityMultiplier).toInt()
-        val height = (page.height * densityMultiplier).toInt()
+            val page = renderer.openPage(pageIndex)
+            try {
+                val width = (page.width * densityMultiplier).toInt()
+                val height = (page.height * densityMultiplier).toInt()
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        bitmap.eraseColor(Color.WHITE)
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmap.eraseColor(Color.WHITE)
 
-        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-        page.close()
-        return@withContext bitmap
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                return@withContext bitmap
+            } finally {
+                page.close()
+            }
+        }
     }
 
     suspend fun extractTextBlocks(pageIndex: Int, file: File? = currentFile): List<PdfTextBlock> = withContext(Dispatchers.IO) {
@@ -74,15 +82,13 @@ class PdfEngine(private val context: Context) {
         if (!targetFile.exists()) return@withContext emptyList()
 
         try {
-            val doc = PDDocument.load(targetFile)
-            if (pageIndex < 0 || pageIndex >= doc.numberOfPages) {
-                doc.close()
-                return@withContext emptyList()
+            PDDocument.load(targetFile).use { doc ->
+                if (pageIndex < 0 || pageIndex >= doc.numberOfPages) {
+                    return@withContext emptyList()
+                }
+                val locator = PdfTextLocator(pageIndex)
+                return@withContext locator.locateTextBlocks(doc)
             }
-            val locator = PdfTextLocator(pageIndex)
-            val blocks = locator.locateTextBlocks(doc)
-            doc.close()
-            return@withContext blocks
         } catch (e: Exception) {
             return@withContext emptyList()
         }
@@ -91,7 +97,9 @@ class PdfEngine(private val context: Context) {
     private fun resolveFont(doc: PDDocument): Pair<PDFont, Boolean> {
         val candidateFontPaths = listOf(
             "/system/fonts/Roboto-Regular.ttf",
+            "/system/fonts/RobotoStatic-Regular.ttf",
             "/system/fonts/NotoSans-Regular.ttf",
+            "/system/fonts/NotoSansTurkish-Regular.ttf",
             "/system/fonts/DroidSans.ttf"
         )
 
@@ -109,13 +117,32 @@ class PdfEngine(private val context: Context) {
     }
 
     private fun sanitizeForType1(text: String): String {
-        return text
-            .replace('ı', 'i').replace('İ', 'I')
-            .replace('ş', 's').replace('Ş', 'S')
-            .replace('ğ', 'g').replace('Ğ', 'G')
-            .replace('ç', 'c').replace('Ç', 'C')
-            .replace('ö', 'o').replace('Ö', 'O')
-            .replace('ü', 'u').replace('Ü', 'U')
+        val sb = StringBuilder(text.length)
+        for (c in text) {
+            when (c) {
+                'ı' -> sb.append('i')
+                'İ' -> sb.append('I')
+                'ş' -> sb.append('s')
+                'Ş' -> sb.append('S')
+                'ğ' -> sb.append('g')
+                'Ğ' -> sb.append('G')
+                'ç' -> sb.append('c')
+                'Ç' -> sb.append('C')
+                'ö' -> sb.append('o')
+                'Ö' -> sb.append('O')
+                'ü' -> sb.append('u')
+                'Ü' -> sb.append('U')
+                else -> {
+                    // Only include characters in WinAnsiEncoding range
+                    if (c.code in 32..255) {
+                        sb.append(c)
+                    } else {
+                        sb.append('?')
+                    }
+                }
+            }
+        }
+        return sb.toString()
     }
 
     /**
@@ -126,86 +153,100 @@ class PdfEngine(private val context: Context) {
         operation: TextEditOperation,
         targetFile: File
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        try {
-            closeRendererHandles()
+        rendererMutex.withLock {
+            try {
+                closeRendererHandles()
 
-            val doc = PDDocument.load(targetFile)
-            val (font, isUnicodeFont) = resolveFont(doc)
-            val pageIdx = operation.targetBlock.pageIndex
+                PDDocument.load(targetFile).use { doc ->
+                    val (font, isUnicodeFont) = resolveFont(doc)
+                    val pageIdx = operation.targetBlock.pageIndex
 
-            if (pageIdx in 0 until doc.numberOfPages) {
-                val page = doc.getPage(pageIdx)
-                val pageHeight = page.mediaBox.height
+                    if (pageIdx in 0 until doc.numberOfPages) {
+                        val page = doc.getPage(pageIdx)
+                        val pageHeight = page.mediaBox.height
 
-                val contentStream = PDPageContentStream(
-                    doc,
-                    page,
-                    PDPageContentStream.AppendMode.APPEND,
-                    true,
-                    true
-                )
+                        val contentStream = PDPageContentStream(
+                            doc,
+                            page,
+                            PDPageContentStream.AppendMode.APPEND,
+                            true,
+                            true
+                        )
 
-                val bounds = operation.targetBlock.pdfBounds
-                val pdfY = pageHeight - bounds.bottom
-                val boxHeight = bounds.height()
-                val boxWidth = bounds.width()
+                        val bounds = operation.targetBlock.pdfBounds
+                        val pdfY = pageHeight - bounds.bottom
+                        val boxHeight = bounds.height()
+                        val boxWidth = bounds.width()
 
-                // Cover original text area with clean white
-                contentStream.setNonStrokingColor(1f, 1f, 1f)
-                contentStream.addRect(
-                    bounds.left - 1.5f,
-                    pdfY - 1.5f,
-                    boxWidth + 3f,
-                    boxHeight + 3f
-                )
-                contentStream.fill()
+                        // Generous padding around the bounding box to ensure zero text traces remain
+                        val padX = maxOf(4f, operation.targetBlock.fontSize * 0.12f)
+                        val padY = maxOf(3f, operation.targetBlock.fontSize * 0.10f)
 
-                // If not removed, draw the replacement text
-                if (!operation.isRemoved && operation.newText.isNotBlank()) {
-                    var textToWrite = if (isUnicodeFont) operation.newText else sanitizeForType1(operation.newText)
-                    var targetFontSize = operation.targetBlock.fontSize
-                    if (targetFontSize <= 0f) targetFontSize = 12f
+                        contentStream.setNonStrokingColor(1f, 1f, 1f)
+                        contentStream.addRect(
+                            bounds.left - padX,
+                            pdfY - padY,
+                            boxWidth + (padX * 2f),
+                            boxHeight + (padY * 2f)
+                        )
+                        contentStream.fill()
 
-                    var textWidth = try {
-                        font.getStringWidth(textToWrite) / 1000f * targetFontSize
-                    } catch (e: Exception) {
-                        textToWrite = sanitizeForType1(textToWrite)
-                        font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                        // If not removed, draw the replacement text
+                        if (!operation.isRemoved && operation.newText.isNotBlank()) {
+                            var textToWrite = if (isUnicodeFont) operation.newText else sanitizeForType1(operation.newText)
+                            var targetFontSize = operation.targetBlock.fontSize
+                            if (targetFontSize <= 0f) targetFontSize = 12f
+
+                            var textWidth = try {
+                                font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                            } catch (e: Exception) {
+                                textToWrite = sanitizeForType1(textToWrite)
+                                try {
+                                    font.getStringWidth(textToWrite) / 1000f * targetFontSize
+                                } catch (_: Exception) {
+                                    textToWrite.length * targetFontSize * 0.5f
+                                }
+                            }
+
+                            if (textWidth > boxWidth && boxWidth > 1f) {
+                                val ratio = (boxWidth / textWidth).coerceIn(0.4f, 1f)
+                                targetFontSize *= ratio
+                            }
+
+                            val targetY = if (operation.targetBlock.baselineY > 0f) {
+                                pageHeight - operation.targetBlock.baselineY
+                            } else {
+                                pdfY + (boxHeight * 0.15f)
+                            }
+
+                            contentStream.beginText()
+                            contentStream.setFont(font, targetFontSize)
+                            contentStream.setNonStrokingColor(0f, 0f, 0f)
+                            contentStream.newLineAtOffset(bounds.left, targetY)
+                            try {
+                                contentStream.showText(textToWrite)
+                            } catch (e: Exception) {
+                                // If showText fails, try sanitized version
+                                contentStream.showText(sanitizeForType1(textToWrite))
+                            }
+                            contentStream.endText()
+                        }
+
+                        contentStream.close()
                     }
 
-                    if (textWidth > boxWidth && boxWidth > 1f) {
-                        val ratio = (boxWidth / textWidth).coerceIn(0.4f, 1f)
-                        targetFontSize *= ratio
-                    }
-
-                    val targetY = if (operation.targetBlock.baselineY > 0f) {
-                        pageHeight - operation.targetBlock.baselineY
-                    } else {
-                        pdfY + (boxHeight * 0.15f)
-                    }
-
-                    contentStream.beginText()
-                    contentStream.setFont(font, targetFontSize)
-                    contentStream.setNonStrokingColor(0f, 0f, 0f)
-                    contentStream.newLineAtOffset(bounds.left, targetY)
-                    contentStream.showText(textToWrite)
-                    contentStream.endText()
+                    doc.save(targetFile)
                 }
 
-                contentStream.close()
+                currentFile = targetFile
+                openRendererHandles(targetFile)
+                return@withContext Result.success(Unit)
+            } catch (e: Exception) {
+                try {
+                    currentFile?.let { openRendererHandles(it) }
+                } catch (_: Exception) {}
+                return@withContext Result.failure(e)
             }
-
-            doc.save(targetFile)
-            doc.close()
-
-            currentFile = targetFile
-            openRendererHandles(targetFile)
-            return@withContext Result.success(Unit)
-        } catch (e: Exception) {
-            try {
-                currentFile?.let { openRendererHandles(it) }
-            } catch (_: Exception) {}
-            return@withContext Result.failure(e)
         }
     }
 
@@ -231,7 +272,7 @@ class PdfEngine(private val context: Context) {
         contentStream.showText("Sayfa Duzenini Koruyan PDF Duzenleyici")
         contentStream.endText()
 
-        // Horizontal separator line
+        // Horizontal separator
         contentStream.setStrokingColor(0.8f, 0.8f, 0.8f)
         contentStream.setLineWidth(1f)
         contentStream.moveTo(50f, 700f)
@@ -276,6 +317,11 @@ class PdfEngine(private val context: Context) {
     }
 
     fun close() {
+        closeRendererHandles()
+        currentFile = null
+    }
+
+    private fun closeInternal() {
         closeRendererHandles()
         currentFile = null
     }

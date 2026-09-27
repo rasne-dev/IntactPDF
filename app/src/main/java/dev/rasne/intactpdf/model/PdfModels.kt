@@ -25,8 +25,8 @@ data class TextEditOperation(
 )
 
 sealed class PdfLoadState {
-    object Idle : PdfLoadState()
-    object Loading : PdfLoadState()
+    data object Idle : PdfLoadState()
+    data object Loading : PdfLoadState()
     data class Success(val pageCount: Int, val title: String) : PdfLoadState()
     data class Error(val message: String) : PdfLoadState()
 }

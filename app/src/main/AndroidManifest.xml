@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- ZERO INTERNET PERMISSION BY DESIGN: 100% Offline & Private -->
-
     <application
         android:name=".IntactPdfApp"
         android:allowBackup="false"
@@ -25,6 +23,13 @@
             <!-- Handle opening PDF files from other local apps (File Manager, etc.) -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+
+            <!-- Handle sharing PDF files to this app -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="application/pdf" />
             </intent-filter>

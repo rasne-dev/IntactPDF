@@ -89,7 +89,6 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
             val px = pos.xDirAdj
             val py = pos.yDirAdj
             val pw = pos.widthDirAdj
-            val ph = pos.heightDir
 
             if (lastPos != null) {
                 val lineDeltaY = Math.abs(pos.yDirAdj - lastPos!!.yDirAdj)
@@ -114,12 +113,20 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
                 }
             } else {
                 currentText.append(pos.unicode)
-                currentFontSize = pos.fontSizeInPt
+                val fontPt = if (pos.fontSizeInPt > 0f) pos.fontSizeInPt else maxOf(pos.heightDir, 12f)
+                currentFontSize = fontPt
                 currentBaselineY = py
+
+                // Full typographic coverage:
+                // - Ascender and diacritics (İ, Ö, Â, Ä, etc.) reach up to 1.15 * fontPt above baseline (decreasing Y in top-down coordinates)
+                // - Descenders (g, y, p, q, j) reach down to 0.35 * fontPt below baseline (increasing Y in top-down coordinates)
+                val topOfChar = py - (fontPt * 1.15f)
+                val bottomOfChar = py + (fontPt * 0.35f)
+
                 minX = minOf(minX, px)
-                minY = minOf(minY, py - ph)
+                minY = minOf(minY, topOfChar)
                 maxX = maxOf(maxX, px + pw)
-                maxY = maxOf(maxY, py + (ph * 0.2f))
+                maxY = maxOf(maxY, bottomOfChar)
             }
 
             lastPos = pos
