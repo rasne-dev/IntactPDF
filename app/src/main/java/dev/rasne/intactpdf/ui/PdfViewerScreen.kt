@@ -52,6 +52,8 @@ fun PdfViewerScreen(
     val canUndo by viewModel.canUndo.collectAsState()
     val editCount by viewModel.editCount.collectAsState()
     val isSaving by viewModel.isSaving.collectAsState()
+    val isPageLoading by viewModel.isPageLoading.collectAsState()
+    val isEditing by viewModel.isEditing.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
 
     var showTextListSheet by remember { mutableStateOf(false) }
@@ -71,14 +73,8 @@ fun PdfViewerScreen(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destinationUri ->
         destinationUri?.let { uri ->
-            try {
-                context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                    viewModel.saveEditsToDestination(outputStream) {
-                        Toast.makeText(context, "PDF başarıyla kaydedildi.", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            } catch (e: Exception) {
-                Toast.makeText(context, "Kayıt hatası: ${e.message}", Toast.LENGTH_LONG).show()
+            viewModel.saveEditsToDestination(uri) {
+                Toast.makeText(context, "PDF başarıyla kaydedildi.", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -132,7 +128,7 @@ fun PdfViewerScreen(
                     if (loadState is PdfLoadState.Success) {
                         // Undo
                         AnimatedVisibility(visible = canUndo) {
-                            IconButton(onClick = { viewModel.undoLastEdit() }) {
+                            IconButton(onClick = { viewModel.undoLastEdit() }, enabled = !isEditing && !isPageLoading) {
                                 Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Geri Al")
                             }
                         }
@@ -140,6 +136,7 @@ fun PdfViewerScreen(
                         // Toggle Mode button
                         FilledTonalButton(
                             onClick = { viewModel.toggleViewerMode() },
+                            enabled = !isEditing,
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                             colors = if (viewerMode == ViewerMode.EDIT) {
                                 ButtonDefaults.filledTonalButtonColors(
@@ -164,7 +161,7 @@ fun PdfViewerScreen(
                         }
 
                         // Open File
-                        IconButton(onClick = { filePicker.launch(arrayOf("application/pdf")) }) {
+                        IconButton(onClick = { filePicker.launch(arrayOf("application/pdf")) }, enabled = !isEditing && !isSaving) {
                             Icon(Icons.Default.FolderOpen, contentDescription = "PDF Aç")
                         }
 
@@ -201,7 +198,8 @@ fun PdfViewerScreen(
                                         menuExpanded = false
                                         val name = "Duzenlenen_${System.currentTimeMillis()}.pdf"
                                         saveFileLauncher.launch(name)
-                                    }
+                                    },
+                                    enabled = !isEditing && !isSaving
                                 )
                                 DropdownMenuItem(
                                     text = { Text("Paylaş") },
@@ -224,7 +222,8 @@ fun PdfViewerScreen(
                                         } else {
                                             Toast.makeText(context, "Paylaşılacak dosya bulunamadı.", Toast.LENGTH_SHORT).show()
                                         }
-                                    }
+                                    },
+                                    enabled = !isEditing && !isSaving
                                 )
                             }
                         }
@@ -246,7 +245,7 @@ fun PdfViewerScreen(
                 ) {
                     IconButton(
                         onClick = { viewModel.setPage(currentPage - 1) },
-                        enabled = currentPage > 0,
+                        enabled = currentPage > 0 && !isPageLoading && !isEditing,
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.ChevronLeft, contentDescription = "Önceki Sayfa")
@@ -263,7 +262,7 @@ fun PdfViewerScreen(
 
                     IconButton(
                         onClick = { viewModel.setPage(currentPage + 1) },
-                        enabled = currentPage < totalPages - 1,
+                        enabled = currentPage < totalPages - 1 && !isPageLoading && !isEditing,
                         modifier = Modifier.weight(1f)
                     ) {
                         Icon(Icons.Default.ChevronRight, contentDescription = "Sonraki Sayfa")
@@ -358,6 +357,18 @@ fun PdfViewerScreen(
                             }
                         }
 
+                        AnimatedVisibility(visible = isPageLoading) {
+                            Column {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                Text(
+                                    text = "Sayfa hazırlanıyor…",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
                         Box(modifier = Modifier.weight(1f)) {
                             pageBitmap?.let { bmp ->
                                 PdfPageView(
@@ -365,7 +376,7 @@ fun PdfViewerScreen(
                                     textBlocks = textBlocks,
                                     viewerMode = viewerMode,
                                     onBlockClick = { block ->
-                                        viewModel.selectBlock(block)
+                                        if (!isEditing) viewModel.selectBlock(block)
                                     }
                                 )
                             }

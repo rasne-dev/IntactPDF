@@ -20,7 +20,8 @@ fun TextEditDialog(
     onDismiss: () -> Unit,
     onSaveEdit: (newText: String, isRemoved: Boolean) -> Unit
 ) {
-    var editedText by remember { mutableStateOf(block.text) }
+    var editedText by remember(block.id) { mutableStateOf(block.text) }
+    var showDeleteConfirmation by remember { mutableStateOf(false) }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -93,7 +94,7 @@ fun TextEditDialog(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedButton(
-                        onClick = { onSaveEdit("", true) },
+                        onClick = { showDeleteConfirmation = true },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                     ) {
                         Icon(
@@ -124,5 +125,26 @@ fun TextEditDialog(
                 }
             }
         }
+    }
+
+    if (showDeleteConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirmation = false },
+            icon = { Icon(Icons.Default.Delete, contentDescription = null) },
+            title = { Text("Metin silinsin mi?") },
+            text = { Text("Bu işlem PDF'de geri alınabilir bir düzenleme olarak uygulanır.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteConfirmation = false
+                        onSaveEdit("", true)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("Sil") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirmation = false }) { Text("Vazgeç") }
+            }
+        )
     }
 }

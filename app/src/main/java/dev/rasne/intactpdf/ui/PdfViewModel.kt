@@ -18,7 +18,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
 
 private data class UndoSnapshot(
     val file: File,
@@ -59,11 +58,20 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _isSaving = MutableStateFlow(false)
     val isSaving: StateFlow<Boolean> = _isSaving.asStateFlow()
 
+    private val _isPageLoading = MutableStateFlow(false)
+    val isPageLoading: StateFlow<Boolean> = _isPageLoading.asStateFlow()
+
+    private val _isEditing = MutableStateFlow(false)
+    val isEditing: StateFlow<Boolean> = _isEditing.asStateFlow()
+
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
     private var workingFile: File? = null
     private var documentTitle: String = ""
+    /** Invalidates work started for a previously opened or closed document. */
+    private var documentGeneration = 0L
+    private var pageLoadGeneration = 0L
     private val undoHistory = mutableListOf<UndoSnapshot>()
     private val pageBlocksCache = mutableMapOf<Int, MutableList<PdfTextBlock>>()
 
@@ -72,12 +80,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadSamplePdf() {
+        val generation = ++documentGeneration
         viewModelScope.launch {
             _loadState.value = PdfLoadState.Loading
             try {
                 val sampleFile = File(getApplication<Application>().cacheDir, "sample_source_${System.currentTimeMillis()}.pdf")
                 engine.createSamplePdf(sampleFile)
-                openFile(sampleFile, "Örnek Belge")
+                openFile(sampleFile, "Örnek Belge", generation)
             } catch (e: Exception) {
                 _loadState.value = PdfLoadState.Error("Örnek belge oluşturulamadı: ${e.message}")
             }
@@ -85,6 +94,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openFromUri(uri: Uri) {
+        val generation = ++documentGeneration
         viewModelScope.launch {
             _loadState.value = PdfLoadState.Loading
             try {
@@ -110,17 +120,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 val displayName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Belge"
-                openFile(tempFile, displayName)
+                openFile(tempFile, displayName, generation)
             } catch (e: Exception) {
                 _loadState.value = PdfLoadState.Error("Dosya açılamadı: ${e.message}")
             }
         }
     }
 
-    private suspend fun openFile(sourceFile: File, title: String) {
+    private suspend fun openFile(sourceFile: File, title: String, generation: Long) {
+        if (generation != documentGeneration) return
         val context = getApplication<Application>()
         val workFile = File(context.cacheDir, "intact_work_${System.currentTimeMillis()}.pdf")
-        sourceFile.copyTo(workFile, overwrite = true)
+        withContext(Dispatchers.IO) {
+            sourceFile.copyTo(workFile, overwrite = true)
+        }
+        if (generation != documentGeneration) {
+            workFile.delete()
+            return
+        }
         workingFile = workFile
         documentTitle = title
 
@@ -128,6 +145,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         clearUndoHistory()
 
         val count = engine.openFile(workFile)
+        if (generation != documentGeneration) return
         if (count == 0) {
             _loadState.value = PdfLoadState.Error("PDF dosyası okunamadı veya sayfa bulunamadı.")
             return
@@ -138,24 +156,33 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _editCount.value = 0
         _viewerMode.value = ViewerMode.VIEW
         _loadState.value = PdfLoadState.Success(count, title)
-        loadPageData(0)
+        loadPageData(0, ++pageLoadGeneration, generation)
     }
 
-    private suspend fun loadPageData(pageIndex: Int) {
+    private suspend fun loadPageData(pageIndex: Int, requestGeneration: Long, documentGeneration: Long) {
+        _isPageLoading.value = true
         val bitmap = engine.renderPage(pageIndex)
-        _pageBitmap.value = bitmap
-
         val blocks = pageBlocksCache.getOrPut(pageIndex) {
             engine.extractTextBlocks(pageIndex, workingFile).toMutableList()
         }
+
+        // Rendering is asynchronous. Ignore a result once the user has moved on.
+        if (requestGeneration != pageLoadGeneration || documentGeneration != this.documentGeneration || pageIndex != _currentPage.value) {
+            return
+        }
+        _pageBitmap.value = bitmap
         _textBlocks.value = blocks.toList()
+        _isPageLoading.value = false
     }
 
     fun setPage(pageIndex: Int) {
         if (pageIndex in 0 until _totalPages.value) {
             _currentPage.value = pageIndex
+            _selectedBlock.value = null
+            val requestGeneration = ++pageLoadGeneration
+            val activeDocumentGeneration = documentGeneration
             viewModelScope.launch {
-                loadPageData(pageIndex)
+                loadPageData(pageIndex, requestGeneration, activeDocumentGeneration)
             }
         }
     }
@@ -165,6 +192,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyEdit(block: PdfTextBlock, newText: String, isRemoved: Boolean) {
+        if (_isEditing.value) return
         // Skip if nothing changed
         if (!isRemoved && newText == block.text) {
             _selectedBlock.value = null
@@ -173,6 +201,8 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
         val activeWorkFile = workingFile ?: return
         val pageIndex = block.pageIndex
+        val activeDocumentGeneration = documentGeneration
+        _isEditing.value = true
 
         viewModelScope.launch {
             // Ensure the page blocks are loaded in cache before snapshotting
@@ -194,7 +224,9 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             pageBlocksCache[pageIndex] = currentList
-            _textBlocks.value = currentList.toList()
+            if (_currentPage.value == pageIndex) {
+                _textBlocks.value = currentList.toList()
+            }
             _selectedBlock.value = null
 
             val op = TextEditOperation(
@@ -206,23 +238,28 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             val result = engine.applyEditLive(op, activeWorkFile)
 
             result.onSuccess {
+                if (activeDocumentGeneration != documentGeneration) return@onSuccess
                 _editCount.value = _editCount.value + 1
                 _canUndo.value = undoHistory.isNotEmpty()
                 // Re-render ONLY the bitmap, keeping the updated blocks list
                 val updatedBitmap = engine.renderPage(pageIndex)
-                _pageBitmap.value = updatedBitmap
+                if (_currentPage.value == pageIndex) {
+                    _pageBitmap.value = updatedBitmap
+                }
                 _statusMessage.value = if (isRemoved) "Metin silindi" else "Metin güncellendi"
             }.onFailure { err ->
+                if (activeDocumentGeneration != documentGeneration) return@onFailure
                 // Roll back snapshot on failure
                 if (undoHistory.isNotEmpty()) {
                     val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
                     try { failedSnapshot.file.delete() } catch (_: Exception) {}
                     _canUndo.value = undoHistory.isNotEmpty()
                     pageBlocksCache.remove(pageIndex)
-                    loadPageData(pageIndex)
+                    loadPageData(pageIndex, ++pageLoadGeneration, activeDocumentGeneration)
                 }
                 _statusMessage.value = "Düzenleme hatası: ${err.message}"
             }
+            _isEditing.value = false
         }
     }
 
@@ -284,6 +321,8 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     fun isDocumentOpen(): Boolean = _loadState.value is PdfLoadState.Success
 
     fun closeDocument() {
+        documentGeneration++
+        pageLoadGeneration++
         engine.close()
         clearUndoHistory()
         pageBlocksCache.clear()
@@ -296,11 +335,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _totalPages.value = 0
         _currentPage.value = 0
         _editCount.value = 0
+        _isPageLoading.value = false
+        _isEditing.value = false
         _viewerMode.value = ViewerMode.VIEW
         _loadState.value = PdfLoadState.Idle
     }
 
-    fun saveEditsToDestination(outputStream: OutputStream, onSuccess: () -> Unit) {
+    fun saveEditsToDestination(destination: Uri, onSuccess: () -> Unit) {
         val activeWorkFile = workingFile ?: return
 
         viewModelScope.launch {
@@ -308,9 +349,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             var success = false
             withContext(Dispatchers.IO) {
                 try {
-                    activeWorkFile.inputStream().use { input ->
-                        input.copyTo(outputStream)
-                    }
+                    getApplication<Application>().contentResolver.openOutputStream(destination)?.use { output ->
+                        activeWorkFile.inputStream().use { input ->
+                            input.copyTo(output)
+                        }
+                    } ?: throw IllegalStateException("Kaydedilecek konum açılamadı.")
                     success = true
                 } catch (e: Exception) {
                     _statusMessage.value = "Dosya kaydetme hatası: ${e.message}"
