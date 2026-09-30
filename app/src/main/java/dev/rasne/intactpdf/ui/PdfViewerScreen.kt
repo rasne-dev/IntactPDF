@@ -16,6 +16,8 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -24,14 +26,19 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.launch
 import dev.rasne.intactpdf.model.PdfLoadState
 import dev.rasne.intactpdf.model.ViewerMode
 import dev.rasne.intactpdf.ui.components.AddTextDialog
@@ -57,13 +64,32 @@ fun PdfViewerScreen(
     val isPageLoading by viewModel.isPageLoading.collectAsState()
     val isEditing by viewModel.isEditing.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
+    val statusUndoable by viewModel.statusUndoable.collectAsState()
+    val hasUnsavedChanges by viewModel.hasUnsavedChanges.collectAsState()
 
     var showTextListSheet by remember { mutableStateOf(false) }
     var showAddTextDialog by remember { mutableStateOf(false) }
+    var showGoToPageDialog by remember { mutableStateOf(false) }
 
-    // Handle system back press: close document → go home
-    BackHandler(enabled = viewModel.isDocumentOpen()) {
-        viewModel.closeDocument()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val uiScope = rememberCoroutineScope()
+
+    // Kaydedilmemiş değişiklik varken belgeyi kapatan/değiştiren eylemler önce onay ister
+    var pendingLeaveAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // "Kaydet" seçilirse kayıt başarılı olunca yürütülecek eylem
+    var afterSaveAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    val requestLeave: (() -> Unit) -> Unit = { action ->
+        if (loadState is PdfLoadState.Success && hasUnsavedChanges) {
+            pendingLeaveAction = action
+        } else {
+            action()
+        }
+    }
+
+    // Handle system back press: close document → go home (Yükleniyor/Hata ekranlarında da çalışır)
+    BackHandler(enabled = loadState !is PdfLoadState.Idle) {
+        requestLeave { viewModel.closeDocument() }
     }
 
     val filePicker = rememberLauncherForActivityResult(
@@ -75,28 +101,45 @@ fun PdfViewerScreen(
     val saveFileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
     ) { destinationUri ->
-        destinationUri?.let { uri ->
-            viewModel.saveEditsToDestination(uri) {
-                Toast.makeText(context, "PDF başarıyla kaydedildi.", Toast.LENGTH_SHORT).show()
+        if (destinationUri != null) {
+            // Başarı mesajı zaten durum mesajı (Snackbar) olarak gösterilir; ayrıca Toast göstermeye gerek yok
+            viewModel.saveEditsToDestination(destinationUri) {
+                val next = afterSaveAction
+                afterSaveAction = null
+                next?.invoke()
             }
+        } else {
+            afterSaveAction = null
         }
     }
 
+    // Durum mesajları Snackbar ile gösterilir; düzenleme sonuçlarında "Geri Al" eylemi sunulur
     LaunchedEffect(statusMessage) {
-        statusMessage?.let {
-            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
-            viewModel.clearStatusMessage()
+        val message = statusMessage ?: return@LaunchedEffect
+        val offerUndo = statusUndoable && canUndo
+        viewModel.clearStatusMessage()
+        uiScope.launch {
+            snackbarHostState.currentSnackbarData?.dismiss()
+            val result = snackbarHostState.showSnackbar(
+                message = message,
+                actionLabel = if (offerUndo) "Geri Al" else null,
+                duration = SnackbarDuration.Short
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                viewModel.undoLastEdit()
+            }
         }
     }
 
     val bgColor = MaterialTheme.colorScheme.surfaceContainerLow
 
     Scaffold(
+        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             TopAppBar(
                 navigationIcon = {
                     if (loadState is PdfLoadState.Success) {
-                        IconButton(onClick = { viewModel.closeDocument() }) {
+                        IconButton(onClick = { requestLeave { viewModel.closeDocument() } }) {
                             Icon(Icons.Default.Close, contentDescription = "Belgeyi Kapat")
                         }
                     }
@@ -164,7 +207,10 @@ fun PdfViewerScreen(
                         }
 
                         // Open File
-                        IconButton(onClick = { filePicker.launch(arrayOf("application/pdf")) }, enabled = !isEditing && !isSaving) {
+                        IconButton(
+                            onClick = { requestLeave { filePicker.launch(arrayOf("application/pdf")) } },
+                            enabled = !isEditing && !isSaving
+                        ) {
                             Icon(Icons.Default.FolderOpen, contentDescription = "PDF Aç")
                         }
 
@@ -217,8 +263,7 @@ fun PdfViewerScreen(
                                     leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
                                     onClick = {
                                         menuExpanded = false
-                                        val name = "Duzenlenen_${System.currentTimeMillis()}.pdf"
-                                        saveFileLauncher.launch(name)
+                                        saveFileLauncher.launch(viewModel.suggestedFileName())
                                     },
                                     enabled = !isEditing && !isSaving
                                 )
@@ -227,21 +272,26 @@ fun PdfViewerScreen(
                                     leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
                                     onClick = {
                                         menuExpanded = false
-                                        val shareFile = viewModel.getWorkingFileForSharing()
-                                        if (shareFile != null && shareFile.exists()) {
-                                            val uri = FileProvider.getUriForFile(
-                                                context,
-                                                "${context.packageName}.fileprovider",
-                                                shareFile
-                                            )
-                                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                type = "application/pdf"
-                                                putExtra(Intent.EXTRA_STREAM, uri)
-                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        viewModel.prepareShareFile { shareFile ->
+                                            if (shareFile != null && shareFile.exists()) {
+                                                try {
+                                                    val uri = FileProvider.getUriForFile(
+                                                        context,
+                                                        "${context.packageName}.fileprovider",
+                                                        shareFile
+                                                    )
+                                                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                                        type = "application/pdf"
+                                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                    }
+                                                    context.startActivity(Intent.createChooser(shareIntent, "PDF Paylaş"))
+                                                } catch (_: Exception) {
+                                                    Toast.makeText(context, "Paylaşım başlatılamadı.", Toast.LENGTH_SHORT).show()
+                                                }
+                                            } else {
+                                                Toast.makeText(context, "Paylaşılacak dosya bulunamadı.", Toast.LENGTH_SHORT).show()
                                             }
-                                            context.startActivity(Intent.createChooser(shareIntent, "PDF Paylaş"))
-                                        } else {
-                                            Toast.makeText(context, "Paylaşılacak dosya bulunamadı.", Toast.LENGTH_SHORT).show()
                                         }
                                     },
                                     enabled = !isEditing && !isSaving
@@ -309,12 +359,18 @@ fun PdfViewerScreen(
                                 Icon(Icons.Default.ChevronLeft, contentDescription = "Önceki Sayfa")
                             }
 
-                            Text(
-                                text = "${currentPage + 1} / $totalPages",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.padding(horizontal = 8.dp)
-                            )
+                            // Sayıya dokununca "Sayfaya Git" penceresi açılır (çok sayfalı belgelerde hızlı gezinme)
+                            TextButton(
+                                onClick = { showGoToPageDialog = true },
+                                enabled = totalPages > 1 && !isPageLoading && !isEditing,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "${currentPage + 1} / $totalPages",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
 
                             IconButton(
                                 onClick = { viewModel.setPage(currentPage + 1) },
@@ -492,6 +548,76 @@ fun PdfViewerScreen(
                 }
             }
         }
+    }
+
+    // Kaydedilmemiş değişiklik uyarısı
+    pendingLeaveAction?.let { leaveAction ->
+        AlertDialog(
+            onDismissRequest = { pendingLeaveAction = null },
+            icon = { Icon(Icons.Default.Warning, contentDescription = null) },
+            title = { Text("Kaydedilmemiş değişiklikler") },
+            text = { Text("Bu belgede kaydedilmemiş düzenlemeler var. Kaydetmeden devam ederseniz kaybolacaklar.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingLeaveAction = null
+                        afterSaveAction = leaveAction
+                        saveFileLauncher.launch(viewModel.suggestedFileName())
+                    }
+                ) { Text("Kaydet") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { pendingLeaveAction = null }) { Text("Vazgeç") }
+                    TextButton(
+                        onClick = {
+                            pendingLeaveAction = null
+                            leaveAction()
+                        },
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) { Text("Kaydetmeden Devam Et") }
+                }
+            }
+        )
+    }
+
+    // Sayfaya Git
+    if (showGoToPageDialog) {
+        var pageInput by remember { mutableStateOf((currentPage + 1).toString()) }
+        val targetPage = pageInput.toIntOrNull()
+        val isValidPage = targetPage != null && targetPage in 1..totalPages
+        val focusRequester = remember { FocusRequester() }
+        val goToPage = {
+            if (isValidPage && targetPage != null) {
+                showGoToPageDialog = false
+                viewModel.setPage(targetPage - 1)
+            }
+        }
+        LaunchedEffect(Unit) {
+            try { focusRequester.requestFocus() } catch (_: Exception) {}
+        }
+        AlertDialog(
+            onDismissRequest = { showGoToPageDialog = false },
+            title = { Text("Sayfaya Git") },
+            text = {
+                OutlinedTextField(
+                    value = pageInput,
+                    onValueChange = { pageInput = it.filter(Char::isDigit).take(6) },
+                    label = { Text("Sayfa numarası (1–$totalPages)") },
+                    singleLine = true,
+                    isError = pageInput.isNotEmpty() && !isValidPage,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Go),
+                    keyboardActions = KeyboardActions(onGo = { goToPage() }),
+                    modifier = Modifier.focusRequester(focusRequester)
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { goToPage() }, enabled = isValidPage) { Text("Git") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGoToPageDialog = false }) { Text("Vazgeç") }
+            }
+        )
     }
 
     // Text Edit Dialog

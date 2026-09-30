@@ -10,6 +10,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import dev.rasne.intactpdf.model.PdfTextBlock
@@ -20,8 +24,18 @@ fun TextEditDialog(
     onDismiss: () -> Unit,
     onSaveEdit: (newText: String, isRemoved: Boolean) -> Unit
 ) {
-    var editedText by remember(block.id) { mutableStateOf(block.text) }
+    // İmleç metnin sonunda başlar; düzeltme yapmak için doğrudan yazmaya başlanabilir
+    var fieldValue by remember(block.id) {
+        mutableStateOf(TextFieldValue(block.text, TextRange(block.text.length)))
+    }
+    val editedText = fieldValue.text
     var showDeleteConfirmation by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+
+    // Pencere açılır açılmaz klavye gelsin (bir kez daha alana dokunma zorunluluğunu kaldırır)
+    LaunchedEffect(block.id) {
+        try { focusRequester.requestFocus() } catch (_: Exception) {}
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -74,10 +88,16 @@ fun TextEditDialog(
                 }
 
                 OutlinedTextField(
-                    value = editedText,
-                    onValueChange = { editedText = it },
+                    value = fieldValue,
+                    onValueChange = { newValue ->
+                        // PDF'deki her blok tek satırdır; satır sonları '?' olarak yazılmasın diye boşluğa çevrilir
+                        val cleaned = newValue.text.replace('\n', ' ').replace('\r', ' ')
+                        fieldValue = if (cleaned == newValue.text) newValue else newValue.copy(text = cleaned)
+                    },
                     label = { Text("Yeni Metin") },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
                     singleLine = false,
                     maxLines = 4
                 )
@@ -111,9 +131,11 @@ fun TextEditDialog(
                             Text("İptal")
                         }
                         Button(
+                            // Metin değişmediyse "Uygula" anlamsız; boş bırakılırsa silme onayına yönlendirilir
+                            enabled = editedText != block.text,
                             onClick = {
                                 if (editedText.isBlank()) {
-                                    onSaveEdit("", true)
+                                    showDeleteConfirmation = true
                                 } else {
                                     onSaveEdit(editedText, false)
                                 }
@@ -132,7 +154,13 @@ fun TextEditDialog(
             onDismissRequest = { showDeleteConfirmation = false },
             icon = { Icon(Icons.Default.Delete, contentDescription = null) },
             title = { Text("Metin silinsin mi?") },
-            text = { Text("Bu işlem PDF'de geri alınabilir bir düzenleme olarak uygulanır.") },
+            text = {
+                Text(
+                    "Metin sayfada beyaz bir kutuyla kapatılır; bu işlem geri alınabilir.\n\n" +
+                        "Not: Metin PDF dosyasının içinden tamamen silinmez, yalnızca görünmez hale getirilir. " +
+                        "Gizli bilgi içeren bir belgeyi paylaşmadan önce bunu göz önünde bulundurun."
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {

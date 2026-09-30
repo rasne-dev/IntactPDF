@@ -13,6 +13,7 @@ import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 import com.tom_roush.pdfbox.pdmodel.font.PDFont
 import com.tom_roush.pdfbox.pdmodel.font.PDType0Font
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
+import com.tom_roush.pdfbox.util.Matrix
 import dev.rasne.intactpdf.model.PdfTextBlock
 import dev.rasne.intactpdf.model.TextEditOperation
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +31,11 @@ class PdfEngine(private val context: Context) {
 
     // Mutex to prevent concurrent PdfRenderer access (Android requires single-threaded usage)
     private val rendererMutex = Mutex()
+
+    private companion object {
+        /** Tek bir sayfa bitmap'i için piksel bütçesi (~48 MB ARGB_8888). Büyük sayfalarda OOM'u önler. */
+        const val MAX_RENDER_PIXELS = 12_000_000L
+    }
 
     suspend fun openFile(file: File): Int = withContext(Dispatchers.IO) {
         rendererMutex.withLock {
@@ -58,21 +64,33 @@ class PdfEngine(private val context: Context) {
         pfd = null
     }
 
-    suspend fun renderPage(pageIndex: Int, densityMultiplier: Float = 2.0f): Bitmap? = withContext(Dispatchers.IO) {
+    suspend fun renderPage(pageIndex: Int, densityMultiplier: Float = 3.0f): Bitmap? = withContext(Dispatchers.IO) {
         rendererMutex.withLock {
             val renderer = nativeRenderer ?: return@withContext null
             if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
 
             val page = renderer.openPage(pageIndex)
             try {
-                val width = (page.width * densityMultiplier).toInt()
-                val height = (page.height * densityMultiplier).toInt()
+                // Poster/plan gibi çok büyük sayfalarda bellek taşmasını önlemek için ölçeği sınırla
+                var scale = PageGeometry.cappedRenderScale(page.width, page.height, densityMultiplier, MAX_RENDER_PIXELS)
+                var attempt = 0
+                while (attempt < 2) {
+                    try {
+                        val width = (page.width * scale).toInt().coerceAtLeast(1)
+                        val height = (page.height * scale).toInt().coerceAtLeast(1)
 
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                bitmap.eraseColor(Color.WHITE)
+                        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(Color.WHITE)
 
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                return@withContext bitmap
+                        page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        return@withContext bitmap
+                    } catch (_: OutOfMemoryError) {
+                        // Bellek yetmedi: yarı çözünürlükle bir kez daha dene
+                        scale /= 2f
+                        attempt++
+                    }
+                }
+                return@withContext null
             } finally {
                 page.close()
             }
@@ -147,6 +165,69 @@ class PdfEngine(private val context: Context) {
         return sb.toString()
     }
 
+    /** Görüntülenen (CropBox + /Rotate uygulanmış) sayfa yüksekliği. PDFTextStripper koordinatlarıyla aynı uzay. */
+    private fun displayHeightOf(page: PDPage): Float {
+        val crop = page.cropBox
+        return PageGeometry.displaySize(crop.width, crop.height, page.rotation).second
+    }
+
+    /** Görüntülenen (CropBox + /Rotate uygulanmış) sayfa genişliği. */
+    private fun displayWidthOf(page: PDPage): Float {
+        val crop = page.cropBox
+        return PageGeometry.displaySize(crop.width, crop.height, page.rotation).first
+    }
+
+    /**
+     * İçerik akışını "görüntü uzayına" alır: sol-alt orijin, y yukarı, döndürülmüş ve kırpılmış sayfa.
+     * Böylece aşağıdaki çizim kodu, sayfa döndürülmüş veya MediaBox orijini (0,0) değilse de doğru yere yazar.
+     * Standart (döndürülmemiş, orijini 0,0 olan) sayfalarda dönüşüm kimliktir ve hiçbir şey eklenmez.
+     */
+    private fun enterDisplaySpace(contentStream: PDPageContentStream, page: PDPage) {
+        val crop = page.cropBox
+        val m = PageGeometry.displayToUserMatrix(
+            crop.lowerLeftX, crop.lowerLeftY, crop.width, crop.height, page.rotation
+        )
+        if (!PageGeometry.isIdentity(m)) {
+            contentStream.transform(Matrix(m[0], m[1], m[2], m[3], m[4], m[5]))
+        }
+    }
+
+    /**
+     * Satır sonu, sekme ve diğer kontrol karakterlerini tek boşluğa çevirir.
+     * Aksi halde fontlarda glifi olmadığı için metne '?' olarak yazılırdı.
+     */
+    private fun normalizeControlChars(text: String): String {
+        val sb = StringBuilder(text.length)
+        var lastWasSpace = false
+        for (c in text) {
+            val isControl = c.code < 32 || c.code == 0x7F || c == '\u2028' || c == '\u2029'
+            if (isControl) {
+                if (!lastWasSpace) sb.append(' ')
+                lastWasSpace = true
+            } else {
+                sb.append(c)
+                lastWasSpace = (c == ' ')
+            }
+        }
+        return sb.toString().trim()
+    }
+
+    /**
+     * Önce geçici dosyaya yazıp sonra yerine taşır. Kayıt sırasında (disk dolu, süreç ölümü vb.)
+     * hata olursa çalışma dosyası bozulmaz ve önceki hali korunur.
+     */
+    private fun saveAtomically(doc: PDDocument, target: File) {
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        try {
+            doc.save(tmp)
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+            }
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
+    }
+
     /**
      * Applies a modification directly to the working PDF file,
      * re-opens renderer handles, allowing instant live re-rendering.
@@ -165,7 +246,7 @@ class PdfEngine(private val context: Context) {
 
                     if (pageIdx in 0 until doc.numberOfPages) {
                         val page = doc.getPage(pageIdx)
-                        val pageHeight = page.mediaBox.height
+                        val pageHeight = displayHeightOf(page)
 
                         val contentStream = PDPageContentStream(
                             doc,
@@ -174,6 +255,7 @@ class PdfEngine(private val context: Context) {
                             true,
                             true
                         )
+                        enterDisplaySpace(contentStream, page)
 
                         val bounds = operation.targetBlock.pdfBounds
                         val pdfY = pageHeight - bounds.bottom
@@ -195,7 +277,8 @@ class PdfEngine(private val context: Context) {
 
                         // If not removed, draw the replacement text
                         if (!operation.isRemoved && operation.newText.isNotBlank()) {
-                            var textToWrite = if (isUnicodeFont) operation.newText else sanitizeForType1(operation.newText)
+                            val cleanedNewText = normalizeControlChars(operation.newText)
+                            var textToWrite = if (isUnicodeFont) cleanedNewText else sanitizeForType1(cleanedNewText)
                             var targetFontSize = operation.targetBlock.fontSize
                             if (targetFontSize <= 0f) targetFontSize = 12f
 
@@ -237,7 +320,7 @@ class PdfEngine(private val context: Context) {
                         contentStream.close()
                     }
 
-                    doc.save(targetFile)
+                    saveAtomically(doc, targetFile)
                 }
 
                 currentFile = targetFile
@@ -269,8 +352,8 @@ class PdfEngine(private val context: Context) {
                     val (font, isUnicodeFont) = resolveFont(doc)
                     if (pageIndex in 0 until doc.numberOfPages) {
                         val page = doc.getPage(pageIndex)
-                        val pageWidth = page.mediaBox.width
-                        val pageHeight = page.mediaBox.height
+                        val pageWidth = displayWidthOf(page)
+                        val pageHeight = displayHeightOf(page)
 
                         val contentStream = PDPageContentStream(
                             doc,
@@ -279,8 +362,10 @@ class PdfEngine(private val context: Context) {
                             true,
                             true
                         )
+                        enterDisplaySpace(contentStream, page)
 
-                        val textToWrite = if (isUnicodeFont) text else sanitizeForType1(text)
+                        val cleanedText = normalizeControlChars(text)
+                        val textToWrite = if (isUnicodeFont) cleanedText else sanitizeForType1(cleanedText)
                         val targetFontSize = if (fontSize > 0f) fontSize else 14f
 
                         val textWidth = try {
@@ -337,7 +422,7 @@ class PdfEngine(private val context: Context) {
                         )
                     }
 
-                    doc.save(targetFile)
+                    saveAtomically(doc, targetFile)
                 }
 
                 currentFile = targetFile
@@ -369,8 +454,8 @@ class PdfEngine(private val context: Context) {
 
                     if (pageIdx in 0 until doc.numberOfPages) {
                         val page = doc.getPage(pageIdx)
-                        val pageWidth = page.mediaBox.width
-                        val pageHeight = page.mediaBox.height
+                        val pageWidth = displayWidthOf(page)
+                        val pageHeight = displayHeightOf(page)
 
                         val contentStream = PDPageContentStream(
                             doc,
@@ -379,6 +464,7 @@ class PdfEngine(private val context: Context) {
                             true,
                             true
                         )
+                        enterDisplaySpace(contentStream, page)
 
                         // 1. Cover original text with whiteout
                         val bounds = block.pdfBounds
@@ -399,7 +485,8 @@ class PdfEngine(private val context: Context) {
                         contentStream.fill()
 
                         // 2. Draw text at new location
-                        val textToWrite = if (isUnicodeFont) block.text else sanitizeForType1(block.text)
+                        val cleanedBlockText = normalizeControlChars(block.text)
+                        val textToWrite = if (isUnicodeFont) cleanedBlockText else sanitizeForType1(cleanedBlockText)
                         val targetFontSize = if (block.fontSize > 0f) block.fontSize else 12f
 
                         val textWidth = try {
@@ -452,7 +539,7 @@ class PdfEngine(private val context: Context) {
                         )
                     }
 
-                    doc.save(targetFile)
+                    saveAtomically(doc, targetFile)
                 }
 
                 currentFile = targetFile
@@ -467,6 +554,33 @@ class PdfEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Geri alma için: çalışma dosyasını anlık görüntüyle değiştirir.
+     * Render tutamaçları mutex altında kapatılıp yeniden açıldığından, sürmekte olan bir render
+     * ile çakışıp çökme riski yoktur. Kopyalama önce geçici dosyaya yapılır; başarısız olursa
+     * mevcut çalışma dosyası bozulmaz.
+     */
+    suspend fun restoreFile(snapshot: File, target: File): Int = withContext(Dispatchers.IO) {
+        rendererMutex.withLock {
+            closeRendererHandles()
+            val tmp = File(target.parentFile, target.name + ".restore")
+            try {
+                snapshot.copyTo(tmp, overwrite = true)
+                if (!tmp.renameTo(target)) {
+                    tmp.copyTo(target, overwrite = true)
+                }
+            } catch (e: Exception) {
+                try { openRendererHandles(target) } catch (_: Exception) {}
+                throw e
+            } finally {
+                if (tmp.exists()) tmp.delete()
+            }
+            currentFile = target
+            openRendererHandles(target)
+            return@withContext nativeRenderer?.pageCount ?: 0
+        }
+    }
+
     suspend fun addNewPage(
         targetFile: File,
         insertAfterPageIndex: Int = -1
@@ -477,14 +591,23 @@ class PdfEngine(private val context: Context) {
 
                 var newCount = 0
                 PDDocument.load(targetFile).use { doc ->
-                    val pageSize = if (doc.numberOfPages > 0) {
-                        val first = doc.getPage(0).mediaBox
-                        PDRectangle(first.width, first.height)
+                    val referencePage = if (doc.numberOfPages > 0) {
+                        doc.getPage(
+                            if (insertAfterPageIndex in 0 until doc.numberOfPages) insertAfterPageIndex else 0
+                        )
+                    } else {
+                        null
+                    }
+                    val pageSize = if (referencePage != null) {
+                        val ref = referencePage.mediaBox
+                        PDRectangle(ref.width, ref.height)
                     } else {
                         PDRectangle.A4
                     }
 
                     val newPage = PDPage(pageSize)
+                    // Yeni sayfa, yanına eklendiği sayfayla aynı yönde görünsün
+                    if (referencePage != null) newPage.rotation = referencePage.rotation
                     val total = doc.numberOfPages
 
                     if (insertAfterPageIndex in 0 until (total - 1)) {
@@ -494,7 +617,7 @@ class PdfEngine(private val context: Context) {
                         doc.addPage(newPage)
                     }
 
-                    doc.save(targetFile)
+                    saveAtomically(doc, targetFile)
                     newCount = doc.numberOfPages
                 }
 

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Karanlık mod: pencere arka planı da koyu olsun (aksi halde açılışta beyaz bir parlama olur) -->
+    <style name="Theme.IntactPDF" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

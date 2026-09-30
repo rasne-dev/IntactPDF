@@ -3,6 +3,7 @@ package dev.rasne.intactpdf.ui
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.rasne.intactpdf.core.PdfEngine
@@ -12,8 +13,11 @@ import dev.rasne.intactpdf.model.TextEditOperation
 import dev.rasne.intactpdf.model.ViewerMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -21,10 +25,18 @@ import java.io.FileOutputStream
 
 private data class UndoSnapshot(
     val file: File,
-    val blocksMap: Map<Int, List<PdfTextBlock>>
+    val blocksMap: Map<Int, List<PdfTextBlock>>,
+    /** Bu anlık görüntü alındığında belgenin revizyon numarası (geri alınca buna dönülür). */
+    val revision: Long = 0L
 )
 
 class PdfViewModel(application: Application) : AndroidViewModel(application) {
+
+    private companion object {
+        const val MAX_UNDO_STEPS = 20
+        /** Geri alma anlık görüntülerinin toplam disk bütçesi. Büyük PDF'lerde önbelleğin şişmesini önler. */
+        const val MAX_UNDO_BYTES = 256L * 1024L * 1024L
+    }
 
     private val engine = PdfEngine(application)
 
@@ -67,6 +79,22 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private val _statusMessage = MutableStateFlow<String?>(null)
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
+    /** Mevcut durum mesajı bir düzenlemenin sonucuysa true (arayüz "Geri Al" eylemi sunabilir). */
+    private val _statusUndoable = MutableStateFlow(false)
+    val statusUndoable: StateFlow<Boolean> = _statusUndoable.asStateFlow()
+
+    /**
+     * Revizyon takibi: her başarılı değişiklik yeni bir numara üretir, geri alma önceki numaraya döner.
+     * Kaydedilen revizyon ile mevcut revizyon farklıysa kaydedilmemiş değişiklik vardır.
+     * (Salt düzenleme sayısına bakmak "düzenle, kaydet, geri al, başka düzenle" gibi durumlarda yanılır.)
+     */
+    private var revisionCounter = 0L
+    private val _revision = MutableStateFlow(0L)
+    private val _savedRevision = MutableStateFlow(0L)
+    val hasUnsavedChanges: StateFlow<Boolean> =
+        combine(_revision, _savedRevision) { current, saved -> current != saved }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
     private var workingFile: File? = null
     private var documentTitle: String = ""
     /** Invalidates work started for a previously opened or closed document. */
@@ -74,6 +102,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     private var pageLoadGeneration = 0L
     private val undoHistory = mutableListOf<UndoSnapshot>()
     private val pageBlocksCache = mutableMapOf<Int, MutableList<PdfTextBlock>>()
+
+    private fun postStatus(message: String, undoable: Boolean = false) {
+        _statusUndoable.value = undoable
+        _statusMessage.value = message
+    }
+
+    private fun resetRevisions() {
+        revisionCounter = 0L
+        _revision.value = 0L
+        _savedRevision.value = 0L
+    }
+
+    /** Başarılı her değişiklikten sonra ortak durum güncellemesi. */
+    private fun markModified() {
+        _revision.value = ++revisionCounter
+        _editCount.value = _editCount.value + 1
+        _canUndo.value = undoHistory.isNotEmpty()
+    }
 
     fun toggleViewerMode() {
         _viewerMode.value = if (_viewerMode.value == ViewerMode.VIEW) ViewerMode.EDIT else ViewerMode.VIEW
@@ -97,52 +143,110 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         val generation = ++documentGeneration
         viewModelScope.launch {
             _loadState.value = PdfLoadState.Loading
+            var tempFile: File? = null
             try {
                 val context = getApplication<Application>()
-                val tempFile = File(context.cacheDir, "opened_doc_${System.currentTimeMillis()}.pdf")
+                val target = File(context.cacheDir, "opened_doc_${System.currentTimeMillis()}.pdf")
+                tempFile = target
 
-                val inputStream = context.contentResolver.openInputStream(uri)
-                if (inputStream == null) {
-                    _loadState.value = PdfLoadState.Error("Dosya okunamadı. Lütfen farklı bir dosya deneyin.")
-                    return@launch
-                }
-
-                inputStream.use { input ->
-                    FileOutputStream(tempFile).use { output ->
-                        input.copyTo(output)
+                // Kopyalama ana iş parçacığında yapılırsa büyük dosyalarda / yavaş sağlayıcılarda (ör. bulut) ANR olur
+                val copiedBytes = withContext(Dispatchers.IO) {
+                    val input = context.contentResolver.openInputStream(uri) ?: return@withContext -1L
+                    input.use { i ->
+                        FileOutputStream(target).use { o ->
+                            i.copyTo(o)
+                        }
                     }
                 }
 
-                if (tempFile.length() == 0L) {
-                    tempFile.delete()
+                if (generation != documentGeneration) {
+                    // Kullanıcı bu arada başka bir belge açtı ya da belgeyi kapattı
+                    target.delete()
+                    return@launch
+                }
+                if (copiedBytes < 0L) {
+                    target.delete()
+                    _loadState.value = PdfLoadState.Error("Dosya okunamadı. Lütfen farklı bir dosya deneyin.")
+                    return@launch
+                }
+                if (copiedBytes == 0L) {
+                    target.delete()
                     _loadState.value = PdfLoadState.Error("Dosya boş. Lütfen geçerli bir PDF seçin.")
                     return@launch
                 }
 
-                val displayName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Belge"
-                openFile(tempFile, displayName, generation)
+                val displayName = withContext(Dispatchers.IO) { resolveDisplayName(uri) }
+                openFile(target, displayName, generation)
             } catch (e: Exception) {
-                _loadState.value = PdfLoadState.Error("Dosya açılamadı: ${e.message}")
+                try { tempFile?.delete() } catch (_: Exception) {}
+                if (generation == documentGeneration) {
+                    _loadState.value = PdfLoadState.Error(friendlyOpenError(e))
+                }
             }
         }
     }
 
+    /** Belge adını sağlayıcıdan alır (content:// URI'lerinin son parçası çoğu zaman anlamsız bir sayıdır). */
+    private fun resolveDisplayName(uri: Uri): String {
+        try {
+            getApplication<Application>().contentResolver
+                .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (index >= 0) {
+                            val name = cursor.getString(index)
+                            if (!name.isNullOrBlank()) {
+                                return name.substringBeforeLast('.', name)
+                            }
+                        }
+                    }
+                }
+        } catch (_: Exception) {
+            // Sağlayıcı sorguyu desteklemiyorsa aşağıdaki yedek yönteme düş
+        }
+        return uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.') ?: "Belge"
+    }
+
+    private fun friendlyOpenError(e: Exception): String = when (e) {
+        is SecurityException ->
+            "Bu PDF parola korumalı. Parola korumalı belgeler şu an desteklenmiyor."
+        is java.io.FileNotFoundException ->
+            "Dosya bulunamadı ya da erişim izni verilmedi."
+        is java.io.IOException ->
+            "PDF okunamadı. Dosya bozuk olabilir."
+        else -> "Dosya açılamadı: ${e.message}"
+    }
+
     private suspend fun openFile(sourceFile: File, title: String, generation: Long) {
-        if (generation != documentGeneration) return
+        if (generation != documentGeneration) {
+            withContext(Dispatchers.IO) { sourceFile.delete() }
+            return
+        }
         val context = getApplication<Application>()
         val workFile = File(context.cacheDir, "intact_work_${System.currentTimeMillis()}.pdf")
         withContext(Dispatchers.IO) {
             sourceFile.copyTo(workFile, overwrite = true)
+            // Geçici kaynak kopya artık gereksiz; silinmezse her açılışta önbellekte iki kat yer kaplar
+            sourceFile.delete()
         }
         if (generation != documentGeneration) {
             workFile.delete()
             return
         }
+        val previousWorkFile = workingFile
         workingFile = workFile
         documentTitle = title
 
         pageBlocksCache.clear()
         clearUndoHistory()
+        resetRevisions()
+        _selectedBlock.value = null
+
+        // Önceki belgenin çalışma kopyası artık gereksiz (Linux'ta açık dosya silinebilir; motor tutamacı yeniden açılırken bırakır)
+        if (previousWorkFile != null && previousWorkFile != workFile) {
+            withContext(Dispatchers.IO) { previousWorkFile.delete() }
+        }
 
         val count = engine.openFile(workFile)
         if (generation != documentGeneration) return
@@ -161,18 +265,30 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun loadPageData(pageIndex: Int, requestGeneration: Long, documentGeneration: Long) {
         _isPageLoading.value = true
-        val bitmap = engine.renderPage(pageIndex)
-        val blocks = pageBlocksCache.getOrPut(pageIndex) {
-            engine.extractTextBlocks(pageIndex, workingFile).toMutableList()
-        }
+        try {
+            val bitmap = engine.renderPage(pageIndex)
+            val blocks = pageBlocksCache.getOrPut(pageIndex) {
+                engine.extractTextBlocks(pageIndex, workingFile).toMutableList()
+            }
 
-        // Rendering is asynchronous. Ignore a result once the user has moved on.
-        if (requestGeneration != pageLoadGeneration || documentGeneration != this.documentGeneration || pageIndex != _currentPage.value) {
-            return
+            // Rendering is asynchronous. Ignore a result once the user has moved on.
+            if (requestGeneration != pageLoadGeneration || documentGeneration != this.documentGeneration || pageIndex != _currentPage.value) {
+                return
+            }
+            _pageBitmap.value = bitmap
+            _textBlocks.value = blocks.toList()
+            _isPageLoading.value = false
+            if (bitmap == null) {
+                postStatus("Sayfa görüntülenemedi (bellek yetersiz olabilir).")
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (requestGeneration == pageLoadGeneration && documentGeneration == this.documentGeneration) {
+                _isPageLoading.value = false
+                postStatus("Sayfa yüklenemedi: ${e.message}")
+            }
         }
-        _pageBitmap.value = bitmap
-        _textBlocks.value = blocks.toList()
-        _isPageLoading.value = false
     }
 
     fun setPage(pageIndex: Int) {
@@ -192,7 +308,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyEdit(block: PdfTextBlock, newText: String, isRemoved: Boolean) {
-        if (_isEditing.value) return
+        if (_isEditing.value || _isSaving.value) return
         // Skip if nothing changed
         if (!isRemoved && newText == block.text) {
             _selectedBlock.value = null
@@ -211,10 +327,11 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             // Push snapshot for undo
-            pushUndoSnapshot(activeWorkFile)
+            val snapshot = pushUndoSnapshot(activeWorkFile)
 
             // Update blocks cache immediately so the bounding box disappears/updates instantly
             val currentList = pageBlocksCache[pageIndex] ?: mutableListOf()
+            val listBeforeEdit = currentList.toList()
             if (isRemoved) {
                 currentList.removeAll { it.id == block.id }
             } else {
@@ -239,32 +356,31 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
             result.onSuccess {
                 if (activeDocumentGeneration != documentGeneration) return@onSuccess
-                _editCount.value = _editCount.value + 1
-                _canUndo.value = undoHistory.isNotEmpty()
+                markModified()
                 // Re-render ONLY the bitmap, keeping the updated blocks list
                 val updatedBitmap = engine.renderPage(pageIndex)
                 if (_currentPage.value == pageIndex) {
                     _pageBitmap.value = updatedBitmap
                 }
-                _statusMessage.value = if (isRemoved) "Metin silindi" else "Metin güncellendi"
+                postStatus(if (isRemoved) "Metin silindi" else "Metin güncellendi", undoable = snapshot != null)
             }.onFailure { err ->
                 if (activeDocumentGeneration != documentGeneration) return@onFailure
-                // Roll back snapshot on failure
-                if (undoHistory.isNotEmpty()) {
-                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
-                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
-                    _canUndo.value = undoHistory.isNotEmpty()
-                    pageBlocksCache.remove(pageIndex)
-                    loadPageData(pageIndex, ++pageLoadGeneration, activeDocumentGeneration)
+                // Yalnızca BU işlemin anlık görüntüsünü geri al (önceki işlemlerin anlık görüntülerine dokunma)
+                discardSnapshot(snapshot)
+                // Önbellek iyimser biçimde güncellenmişti; dosya değişmediği için önceki listeye dön.
+                // (Dosyadan yeniden çıkarmak, önceki düzenlemelerle gizlenen orijinal metinleri de geri getirirdi.)
+                pageBlocksCache[pageIndex] = listBeforeEdit.toMutableList()
+                if (_currentPage.value == pageIndex) {
+                    _textBlocks.value = listBeforeEdit
                 }
-                _statusMessage.value = "Düzenleme hatası: ${err.message}"
+                postStatus("Düzenleme hatası: ${err.message}")
             }
             _isEditing.value = false
         }
     }
 
     fun addNewText(text: String, fontSize: Float = 14f, normX: Float = 0.25f, normY: Float = 0.5f) {
-        if (_isEditing.value || text.isBlank()) return
+        if (_isEditing.value || _isSaving.value || text.isBlank()) return
         val activeWorkFile = workingFile ?: return
         val pageIndex = _currentPage.value
         val activeDocumentGeneration = documentGeneration
@@ -275,7 +391,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 pageBlocksCache[pageIndex] = engine.extractTextBlocks(pageIndex, activeWorkFile).toMutableList()
             }
 
-            pushUndoSnapshot(activeWorkFile)
+            val snapshot = pushUndoSnapshot(activeWorkFile)
 
             val result = engine.addTextLive(
                 targetFile = activeWorkFile,
@@ -292,29 +408,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 currentList.add(newBlock)
                 pageBlocksCache[pageIndex] = currentList
                 _textBlocks.value = currentList.toList()
-                _editCount.value = _editCount.value + 1
-                _canUndo.value = undoHistory.isNotEmpty()
+                markModified()
 
                 val updatedBitmap = engine.renderPage(pageIndex)
                 if (_currentPage.value == pageIndex) {
                     _pageBitmap.value = updatedBitmap
                 }
-                _statusMessage.value = "Yeni metin eklendi"
+                postStatus("Yeni metin eklendi", undoable = snapshot != null)
             }.onFailure { err ->
                 if (activeDocumentGeneration != documentGeneration) return@onFailure
-                if (undoHistory.isNotEmpty()) {
-                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
-                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
-                    _canUndo.value = undoHistory.isNotEmpty()
-                }
-                _statusMessage.value = "Metin ekleme hatası: ${err.message}"
+                discardSnapshot(snapshot)
+                postStatus("Metin ekleme hatası: ${err.message}")
             }
             _isEditing.value = false
         }
     }
 
     fun moveTextBlock(block: PdfTextBlock, newNormX: Float, newNormY: Float) {
-        if (_isEditing.value) return
+        if (_isEditing.value || _isSaving.value) return
         val activeWorkFile = workingFile ?: return
         val pageIndex = block.pageIndex
         val activeDocumentGeneration = documentGeneration
@@ -325,7 +436,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 pageBlocksCache[pageIndex] = engine.extractTextBlocks(pageIndex, activeWorkFile).toMutableList()
             }
 
-            pushUndoSnapshot(activeWorkFile)
+            val snapshot = pushUndoSnapshot(activeWorkFile)
 
             val result = engine.moveTextBlockLive(
                 targetFile = activeWorkFile,
@@ -345,44 +456,38 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 if (_currentPage.value == pageIndex) {
                     _textBlocks.value = currentList.toList()
                 }
-                _editCount.value = _editCount.value + 1
-                _canUndo.value = undoHistory.isNotEmpty()
+                markModified()
 
                 val updatedBitmap = engine.renderPage(pageIndex)
                 if (_currentPage.value == pageIndex) {
                     _pageBitmap.value = updatedBitmap
                 }
-                _statusMessage.value = "Metin taşındı"
+                postStatus("Metin taşındı", undoable = snapshot != null)
             }.onFailure { err ->
                 if (activeDocumentGeneration != documentGeneration) return@onFailure
-                if (undoHistory.isNotEmpty()) {
-                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
-                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
-                    _canUndo.value = undoHistory.isNotEmpty()
-                }
-                _statusMessage.value = "Metin taşıma hatası: ${err.message}"
+                discardSnapshot(snapshot)
+                postStatus("Metin taşıma hatası: ${err.message}")
             }
             _isEditing.value = false
         }
     }
 
     fun addNewPage() {
-        if (_isEditing.value || _isPageLoading.value) return
+        if (_isEditing.value || _isSaving.value || _isPageLoading.value) return
         val activeWorkFile = workingFile ?: return
         val activeDocumentGeneration = documentGeneration
         val insertAfter = _currentPage.value
         _isEditing.value = true
 
         viewModelScope.launch {
-            pushUndoSnapshot(activeWorkFile)
+            val snapshot = pushUndoSnapshot(activeWorkFile)
 
             val result = engine.addNewPage(activeWorkFile, insertAfter)
 
             result.onSuccess { newTotalPages ->
                 if (activeDocumentGeneration != documentGeneration) return@onSuccess
                 _totalPages.value = newTotalPages
-                _editCount.value = _editCount.value + 1
-                _canUndo.value = undoHistory.isNotEmpty()
+                markModified()
 
                 // Shift any cached pages after the inserted index
                 val newCache = mutableMapOf<Int, MutableList<PdfTextBlock>>()
@@ -400,69 +505,120 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                 val targetPage = (insertAfter + 1).coerceAtMost(newTotalPages - 1)
                 _currentPage.value = targetPage
                 _selectedBlock.value = null
-                _statusMessage.value = "Yeni sayfa eklendi"
+                postStatus("Yeni sayfa eklendi", undoable = snapshot != null)
                 loadPageData(targetPage, ++pageLoadGeneration, activeDocumentGeneration)
             }.onFailure { err ->
                 if (activeDocumentGeneration != documentGeneration) return@onFailure
-                if (undoHistory.isNotEmpty()) {
-                    val failedSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
-                    try { failedSnapshot.file.delete() } catch (_: Exception) {}
-                    _canUndo.value = undoHistory.isNotEmpty()
-                }
-                _statusMessage.value = "Sayfa ekleme hatası: ${err.message}"
+                discardSnapshot(snapshot)
+                postStatus("Sayfa ekleme hatası: ${err.message}")
             }
             _isEditing.value = false
         }
     }
 
     fun undoLastEdit() {
+        // Devam eden bir düzenleme/kaydetme varken geri alma dosyayı ortadan bozabilir
+        if (_isEditing.value || _isSaving.value) return
         val activeWorkFile = workingFile ?: return
         if (undoHistory.isEmpty()) return
+        val activeDocumentGeneration = documentGeneration
+        _isEditing.value = true
 
         viewModelScope.launch {
-            val lastSnapshot = undoHistory.removeAt(undoHistory.lastIndex)
-            _canUndo.value = undoHistory.isNotEmpty()
-            _editCount.value = (_editCount.value - 1).coerceAtLeast(0)
+            try {
+                // Anlık görüntü yalnızca geri yükleme BAŞARILI olursa tüketilir
+                val lastSnapshot = undoHistory.lastOrNull() ?: return@launch
+                val restoredPages = engine.restoreFile(lastSnapshot.file, activeWorkFile)
+                if (activeDocumentGeneration != documentGeneration) {
+                    // Geri yükleme sürerken belge kapatıldı ya da değiştirildi: artık sahipsiz dosyaları temizle
+                    withContext(Dispatchers.IO) {
+                        if (workingFile != activeWorkFile) activeWorkFile.delete()
+                        lastSnapshot.file.delete()
+                    }
+                    return@launch
+                }
 
-            withContext(Dispatchers.IO) {
-                lastSnapshot.file.copyTo(activeWorkFile, overwrite = true)
-                lastSnapshot.file.delete()
-                val restoredPages = engine.openFile(activeWorkFile)
+                undoHistory.removeAll { it === lastSnapshot }
+                withContext(Dispatchers.IO) { lastSnapshot.file.delete() }
+                _canUndo.value = undoHistory.isNotEmpty()
+                _editCount.value = (_editCount.value - 1).coerceAtLeast(0)
+
                 _totalPages.value = restoredPages
                 if (_currentPage.value >= restoredPages) {
                     _currentPage.value = (restoredPages - 1).coerceAtLeast(0)
                 }
-            }
+                _revision.value = lastSnapshot.revision
+                _selectedBlock.value = null
 
-            // Restore blocks cache
-            pageBlocksCache.clear()
-            lastSnapshot.blocksMap.forEach { (page, list) ->
-                pageBlocksCache[page] = list.map { it.copy() }.toMutableList()
-            }
+                // Restore blocks cache
+                pageBlocksCache.clear()
+                lastSnapshot.blocksMap.forEach { (page, list) ->
+                    pageBlocksCache[page] = list.map { it.copy() }.toMutableList()
+                }
 
-            _textBlocks.value = pageBlocksCache[_currentPage.value]?.toList() ?: emptyList()
-            _pageBitmap.value = engine.renderPage(_currentPage.value)
-            _statusMessage.value = "Geri alındı"
+                val page = _currentPage.value
+                val cached = pageBlocksCache[page]
+                if (cached != null) {
+                    _textBlocks.value = cached.toList()
+                    _pageBitmap.value = engine.renderPage(page)
+                } else {
+                    // Anlık görüntü alındığında bu sayfanın metinleri henüz önbellekte değildi.
+                    // Boş bırakmak düzenleme modunda kutuların kaybolmasına yol açardı; yeniden çıkar.
+                    _textBlocks.value = emptyList()
+                    loadPageData(page, ++pageLoadGeneration, activeDocumentGeneration)
+                }
+                postStatus("Geri alındı")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                postStatus("Geri alma hatası: ${e.message}")
+            } finally {
+                _isEditing.value = false
+            }
         }
     }
 
-    private fun pushUndoSnapshot(currentFile: File) {
-        try {
-            val snapshot = File(getApplication<Application>().cacheDir, "undo_${System.currentTimeMillis()}.pdf")
-            currentFile.copyTo(snapshot, overwrite = true)
-
-            val blocksCopy = pageBlocksCache.mapValues { (_, list) ->
-                list.map { it.copy() }
+    /**
+     * Mevcut dosyanın anlık görüntüsünü alır (kopyalama IO iş parçacığında yapılır; büyük PDF'lerde
+     * ana iş parçacığını dondurmaz). Başarısız olursa null döner.
+     */
+    private suspend fun pushUndoSnapshot(currentFile: File): UndoSnapshot? {
+        val snapshotFile = File(getApplication<Application>().cacheDir, "undo_${System.nanoTime()}.pdf")
+        val copied = withContext(Dispatchers.IO) {
+            try {
+                currentFile.copyTo(snapshotFile, overwrite = true)
+                true
+            } catch (_: Exception) {
+                try { snapshotFile.delete() } catch (_: Exception) {}
+                false
             }
-            undoHistory.add(UndoSnapshot(snapshot, blocksCopy))
-            _canUndo.value = true
+        }
+        if (!copied) return null
 
-            // Limit undo history to 20 steps to prevent excessive disk usage
-            while (undoHistory.size > 20) {
-                val oldest = undoHistory.removeAt(0)
-                try { oldest.file.delete() } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
+        val blocksCopy = pageBlocksCache.mapValues { (_, list) ->
+            list.map { it.copy() }
+        }
+        val snapshot = UndoSnapshot(snapshotFile, blocksCopy, _revision.value)
+        undoHistory.add(snapshot)
+        _canUndo.value = true
+
+        // Adım sayısını ve toplam disk kullanımını sınırla
+        while (undoHistory.size > MAX_UNDO_STEPS ||
+            (undoHistory.size > 1 && undoHistory.sumOf { it.file.length() } > MAX_UNDO_BYTES)
+        ) {
+            val oldest = undoHistory.removeAt(0)
+            try { oldest.file.delete() } catch (_: Exception) {}
+        }
+        return snapshot
+    }
+
+    /** Başarısız bir işlemin anlık görüntüsünü (ve yalnızca onu) geçmişten çıkarıp siler. */
+    private fun discardSnapshot(snapshot: UndoSnapshot?) {
+        if (snapshot == null) return
+        if (undoHistory.removeAll { it === snapshot }) {
+            try { snapshot.file.delete() } catch (_: Exception) {}
+        }
+        _canUndo.value = undoHistory.isNotEmpty()
     }
 
     private fun clearUndoHistory() {
@@ -485,6 +641,7 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         workingFile?.let { try { it.delete() } catch (_: Exception) {} }
         workingFile = null
         documentTitle = ""
+        resetRevisions()
         _pageBitmap.value = null
         _textBlocks.value = emptyList()
         _selectedBlock.value = null
@@ -497,8 +654,24 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
         _loadState.value = PdfLoadState.Idle
     }
 
+    /** Kaydetme/paylaşma için önerilen dosya adı: "<belge adı>_duzenlendi.pdf". */
+    fun suggestedFileName(): String {
+        val base = documentTitle
+            .replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_")
+            .trim()
+            .take(80)
+            .ifBlank { "Belge" }
+        return "${base}_duzenlendi.pdf"
+    }
+
     fun saveEditsToDestination(destination: Uri, onSuccess: () -> Unit) {
         val activeWorkFile = workingFile ?: return
+        // Düzenleme sürerken dosya yazılıyor olabilir; yarım yazılmış bir PDF kaydedilmemeli
+        if (_isEditing.value || _isSaving.value) {
+            postStatus("Bir işlem sürüyor, lütfen bekleyin.")
+            return
+        }
+        val revisionAtSave = _revision.value
 
         viewModelScope.launch {
             _isSaving.value = true
@@ -512,12 +685,13 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
                     } ?: throw IllegalStateException("Kaydedilecek konum açılamadı.")
                     success = true
                 } catch (e: Exception) {
-                    _statusMessage.value = "Dosya kaydetme hatası: ${e.message}"
+                    postStatus("Dosya kaydetme hatası: ${e.message}")
                 }
             }
             _isSaving.value = false
             if (success) {
-                _statusMessage.value = "PDF başarıyla kaydedildi!"
+                _savedRevision.value = revisionAtSave
+                postStatus("PDF başarıyla kaydedildi!")
                 onSuccess()
             }
         }
@@ -525,6 +699,38 @@ class PdfViewModel(application: Application) : AndroidViewModel(application) {
 
     fun getWorkingFileForSharing(): File? {
         return workingFile
+    }
+
+    /**
+     * Paylaşım için çalışma kopyasından anlamlı adlı bir kopya üretir (IO iş parçacığında) ve
+     * hazır olunca ana iş parçacığında bildirir. Böylece alıcı uygulama "intact_work_1727...pdf"
+     * yerine "<belge adı>_duzenlendi.pdf" görür.
+     */
+    fun prepareShareFile(onReady: (File?) -> Unit) {
+        val source = workingFile
+        if (source == null) {
+            onReady(null)
+            return
+        }
+        if (_isEditing.value || _isSaving.value) {
+            postStatus("Bir işlem sürüyor, lütfen bekleyin.")
+            return
+        }
+        viewModelScope.launch {
+            val shared = withContext(Dispatchers.IO) {
+                try {
+                    val dir = File(getApplication<Application>().cacheDir, "share")
+                    dir.mkdirs()
+                    dir.listFiles()?.forEach { it.delete() }
+                    val target = File(dir, suggestedFileName())
+                    source.copyTo(target, overwrite = true)
+                    target
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            onReady(shared)
+        }
     }
 
     fun clearStatusMessage() {

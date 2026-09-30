@@ -23,9 +23,12 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
     fun locateTextBlocks(document: PDDocument): List<PdfTextBlock> {
         collectedPositions.clear()
         val page = document.getPage(targetPageIndex)
-        val mediaBox = page.mediaBox
-        pageWidth = mediaBox.width
-        pageHeight = mediaBox.height
+        // PDFTextStripper koordinatları CropBox'a göre ve /Rotate uygulanmış (görüntülenen) uzayda verir.
+        // Normalizasyon da aynı uzaya göre yapılmalı; aksi halde döndürülmüş/kırpılmış sayfalarda kutular kayar.
+        val cropBox = page.cropBox
+        val (dispW, dispH) = PageGeometry.displaySize(cropBox.width, cropBox.height, page.rotation)
+        pageWidth = if (dispW > 0f) dispW else 1f
+        pageHeight = if (dispH > 0f) dispH else 1f
 
         val dummy = StringWriter()
         writeText(document, dummy)
@@ -47,8 +50,8 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
         var currentText = StringBuilder()
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
-        var maxX = Float.MIN_VALUE
-        var maxY = Float.MIN_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
         var currentFontSize = 12f
         var currentBaselineY = 0f
 
@@ -80,8 +83,8 @@ class PdfTextLocator(private val targetPageIndex: Int) : PDFTextStripper() {
             currentText.clear()
             minX = Float.MAX_VALUE
             minY = Float.MAX_VALUE
-            maxX = Float.MIN_VALUE
-            maxY = Float.MIN_VALUE
+            maxX = -Float.MAX_VALUE
+            maxY = -Float.MAX_VALUE
             lastPos = null
         }
 

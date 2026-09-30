@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <cache-path name="pdf_cache" path="." />
-    <files-path name="pdf_files" path="." />
+    <!-- Yalnızca paylaşım için üretilen kopyalar dışarıya açılır; çalışma dosyaları ve geri alma
+         anlık görüntüleri (cache kökü) ile uygulamanın files dizini artık paylaşılamaz. -->
+    <cache-path name="shared_pdf" path="share/" />
 </paths>

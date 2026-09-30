@@ -59,30 +59,49 @@ fun PdfPageView(
 
     val viewConfiguration = LocalViewConfiguration.current
 
+    /**
+     * Yakınlaştırmayı parmakların (ya da çift dokunmanın) olduğu noktaya sabitler ve sayfanın
+     * görünür alanın dışına kaydırılmasını sınırlar. (Eskiden yakınlaştırma hep sayfa merkezine
+     * yapılıyor ve sayfa sınırsızca kaydırılabildiği için ekran dışına atılabiliyordu.)
+     * Dönüşüm: ekran = merkez + öteleme + ölçek * (nokta - merkez).
+     */
+    fun applyZoom(newScale: Float, focus: Offset, pan: Offset, viewW: Float, viewH: Float) {
+        val cx = viewW / 2f
+        val cy = viewH / 2f
+        val ratio = newScale / scale
+        val targetX = focus.x + pan.x - cx - ratio * (focus.x - cx - offsetX)
+        val targetY = focus.y + pan.y - cy - ratio * (focus.y - cy - offsetY)
+        val maxX = (newScale - 1f) * viewW / 2f
+        val maxY = (newScale - 1f) * viewH / 2f
+        scale = newScale
+        offsetX = targetX.coerceIn(-maxX, maxX)
+        offsetY = targetY.coerceIn(-maxY, maxY)
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .pointerInput(Unit) {
-                detectTransformGestures { _, pan, zoom, _ ->
+                detectTransformGestures { centroid, pan, zoom, _ ->
                     // Only pan/zoom when not actively dragging a block
                     if (activeDraggedBlock == null) {
-                        scale = (scale * zoom).coerceIn(1f, 5f)
-                        if (scale > 1f) {
-                            offsetX += pan.x
-                            offsetY += pan.y
-                        } else {
-                            offsetX = 0f
-                            offsetY = 0f
-                        }
+                        val newScale = (scale * zoom).coerceIn(1f, 5f)
+                        applyZoom(newScale, centroid, pan, size.width.toFloat(), size.height.toFloat())
                     }
                 }
             }
             .pointerInput(Unit) {
                 detectTapGestures(
-                    onDoubleTap = {
-                        scale = 1f
-                        offsetX = 0f
-                        offsetY = 0f
+                    onDoubleTap = { tapPosition ->
+                        if (scale > 1.01f) {
+                            // Yakınlaştırılmışsa sıfırla
+                            scale = 1f
+                            offsetX = 0f
+                            offsetY = 0f
+                        } else {
+                            // Değilse dokunulan noktaya 2.5x yakınlaş
+                            applyZoom(2.5f, tapPosition, Offset.Zero, size.width.toFloat(), size.height.toFloat())
+                        }
                     }
                 )
             }
