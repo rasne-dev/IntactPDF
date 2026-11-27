@@ -1,13 +1,18 @@
-package dev.rasne.intactpdf.ui.components
+package dev.rasne.intactfolio.ui.components
 
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 
@@ -18,6 +23,11 @@ fun AddTextDialog(
 ) {
     var text by remember { mutableStateOf("") }
     var fontSize by remember { mutableFloatStateOf(14f) }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) {
+        try { focusRequester.requestFocus() } catch (_: Exception) {}
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -31,6 +41,7 @@ fun AddTextDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -54,7 +65,9 @@ fun AddTextDialog(
                     onValueChange = { text = it },
                     label = { Text("Metin İçeriği") },
                     placeholder = { Text("Eklemek istediğiniz metni yazın...") },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
                     singleLine = false,
                     maxLines = 4
                 )
@@ -77,16 +90,18 @@ fun AddTextDialog(
                         )
                     }
 
-                    // Quick presets
+                    // Quick presets (horizontally scrollable so chips never clip on narrow screens)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         listOf(10f to "Küçük", 12f to "Normal", 16f to "Büyük", 22f to "Başlık").forEach { (size, label) ->
                             FilterChip(
                                 selected = fontSize == size,
                                 onClick = { fontSize = size },
-                                label = { Text(label, style = MaterialTheme.typography.labelSmall) }
+                                label = { Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1) }
                             )
                         }
                     }
@@ -95,7 +110,7 @@ fun AddTextDialog(
                         value = fontSize,
                         onValueChange = { fontSize = it },
                         valueRange = 8f..36f,
-                        steps = 28
+                        steps = 27
                     )
                 }
 

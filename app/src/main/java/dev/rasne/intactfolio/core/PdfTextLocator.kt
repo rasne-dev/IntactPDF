@@ -1,10 +1,10 @@
-package dev.rasne.intactpdf.core
+package dev.rasne.intactfolio.core
 
 import android.graphics.RectF
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
-import dev.rasne.intactpdf.model.PdfTextBlock
+import dev.rasne.intactfolio.model.PdfTextBlock
 import java.io.StringWriter
 import java.util.UUID
 

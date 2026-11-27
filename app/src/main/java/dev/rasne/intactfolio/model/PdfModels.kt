@@ -1,4 +1,4 @@
-package dev.rasne.intactpdf.model
+package dev.rasne.intactfolio.model
 
 import android.graphics.RectF
 
@@ -27,7 +27,11 @@ data class TextEditOperation(
 sealed class PdfLoadState {
     data object Idle : PdfLoadState()
     data object Loading : PdfLoadState()
-    data class Success(val pageCount: Int, val title: String) : PdfLoadState()
+    data class Success(
+        val pageCount: Int,
+        val title: String,
+        val documentType: DocumentType = DocumentType.PDF
+    ) : PdfLoadState()
     data class Error(val message: String) : PdfLoadState()
 }
 

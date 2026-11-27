@@ -1,4 +1,4 @@
-package dev.rasne.intactpdf.ui.components
+package dev.rasne.intactfolio.ui.components
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
@@ -28,9 +28,9 @@ import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import dev.rasne.intactpdf.model.AlignmentGuide
-import dev.rasne.intactpdf.model.PdfTextBlock
-import dev.rasne.intactpdf.model.ViewerMode
+import dev.rasne.intactfolio.model.AlignmentGuide
+import dev.rasne.intactfolio.model.PdfTextBlock
+import dev.rasne.intactfolio.model.ViewerMode
 
 @Composable
 fun PdfPageView(

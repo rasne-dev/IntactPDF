@@ -1,4 +1,4 @@
-package dev.rasne.intactpdf.core
+package dev.rasne.intactfolio.core
 
 /**
  * Saf (Android/PDFBox bağımsız) sayfa geometrisi yardımcıları.

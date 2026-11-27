@@ -1,19 +1,22 @@
-# IntactPDF 📄🛡️
+# IntactFolio 📄🛡️
 
-> **Free, ad-free & offline Android PDF editor preserving document layout.**  
-> *Sayfa yapısını bozmayan, ücretsiz, reklamsız ve yerel Android PDF editörü.*
+> **Free, ad-free & offline Android document viewer and editor for PDF, Word (`.docx`) and Excel (`.xlsx`), preserving document layout and structure.**  
+> *Sayfa ve belge yapısını bozmayan, ücretsiz, reklamsız ve %100 çevrimdışı Android PDF, Word ve Excel görüntüleyici ve düzenleyici.*
 
 ---
 
 ## English
 
-**IntactPDF** is an open-source, privacy-first Android application designed to view and edit PDF text without breaking the original document layout.
+**IntactFolio** is an open-source, privacy-first Android application designed to view and edit **PDF**, **Word (`.docx`)**, and **Excel (`.xlsx`)** documents offline without breaking the original layout or file structure.
 
 ### ✨ Highlights
-* **📐 Layout-Preserving Editing:** Modify or remove existing text without altering page alignment and structure.
-* **🛡️ 100% Offline & Private:** Zero internet permission (`android.permission.INTERNET` is not included in the manifest). No data leaves your device.
+* **📐 Layout & Structure Preserving:**
+  * **PDF:** Edit, move, add, or hide text blocks and insert pages without breaking page alignment.
+  * **Word (`.docx`):** Desktop-style page-by-page Print Layout viewing and structure-preserving paragraph, table cell, and page editing.
+  * **Excel (`.xlsx`):** Multi-sheet viewing with sticky row/column headers and structure-preserving cell, formula, row, and column editing.
+* **🛡️ 100% Offline & Private:** Zero internet permission (`android.permission.INTERNET` is not included in the manifest). No data ever leaves your device.
 * **🚫 Ad-Free & Tracker-Free:** Free forever, no ads, no telemetry, no analytics.
-* **⚡ Native & Lightweight:** Built using modern Kotlin and Jetpack Compose.
+* **⚡ Native & Lightweight:** Built with Kotlin and Jetpack Compose (Material 3).
 
 ### 🚀 Getting Started
 1. Clone the repository:
@@ -27,13 +30,16 @@
 
 ## Türkçe
 
-**IntactPDF**, PDF üzerindeki metinleri sayfa düzenini ve mizanpajını bozmadan düzenlemenizi ve kaldırmanızı sağlayan, gizlilik odaklı ve açık kaynaklı bir Android uygulamasıdır.
+**IntactFolio**, **PDF**, **Word (`.docx`)** ve **Excel (`.xlsx`)** belgelerini sayfa düzenini ve dosya yapısını bozmadan görüntülemenizi ve düzenlemenizi sağlayan, gizlilik odaklı ve açık kaynaklı bir Android uygulamasıdır.
 
 ### ✨ Öne Çıkan Özellikler
-* **📐 Sayfa Düzenini Koruyan Düzenleme:** Sayfa kayması ve hizalama bozukluğu yaşamadan mevcut metinleri düzenleyin veya silin.
+* **📐 Düzeni ve Yapıyı Koruyan Düzenleme:**
+  * **PDF:** Sayfa kayması yaşamadan metin bloklarını düzenleyin, taşıyın, ekleyin, gizleyin ve yeni sayfa ekleyin.
+  * **Word (`.docx`):** Bilgisayardaki gibi sayfa sayfa Baskı Düzeni görünümüyle paragrafları, tablo hücrelerini ve sayfaları yapıyı koruyarak düzenleyin.
+  * **Excel (`.xlsx`):** Sabit satır/sütun başlıklarıyla çoklu çalışma sayfası görüntüleyin; hücreleri, formülleri, satırları ve sütunları düzenleyin.
 * **🛡️ %100 Çevrimdışı ve Güvenli:** İnternet izni (`INTERNET` izni) manifestoda dahi yer almaz. Hiçbir veri cihazınızın dışına çıkmaz.
 * **🚫 Reklamsız ve Takipsiz:** Tamamen ücretsiz, reklamsız ve telemetrisiz.
-* **⚡ Yerel ve Hafif:** Modern Kotlin ve Jetpack Compose ile sıfırdan geliştirilmiştir.
+* **⚡ Yerel ve Hafif:** Modern Kotlin ve Jetpack Compose ile geliştirilmiştir.
 
 ### 🚀 Kurulum ve Çalıştırma
 1. Repoyu klonlayın:

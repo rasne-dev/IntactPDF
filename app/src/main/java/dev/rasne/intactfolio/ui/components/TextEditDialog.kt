@@ -1,8 +1,10 @@
-package dev.rasne.intactpdf.ui.components
+package dev.rasne.intactfolio.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
@@ -16,7 +18,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import dev.rasne.intactpdf.model.PdfTextBlock
+import dev.rasne.intactfolio.model.PdfTextBlock
 
 @Composable
 fun TextEditDialog(
@@ -49,6 +51,7 @@ fun TextEditDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
@@ -75,6 +78,8 @@ fun TextEditDialog(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(max = 88.dp)
+                        .verticalScroll(rememberScrollState())
                         .background(
                             MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                             RoundedCornerShape(8.dp)
@@ -115,6 +120,7 @@ fun TextEditDialog(
                 ) {
                     OutlinedButton(
                         onClick = { showDeleteConfirmation = true },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
                     ) {
                         Icon(
@@ -123,16 +129,17 @@ fun TextEditDialog(
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Metni Sil")
+                        Text("Sil", maxLines = 1)
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         TextButton(onClick = onDismiss) {
-                            Text("İptal")
+                            Text("İptal", maxLines = 1)
                         }
                         Button(
                             // Metin değişmediyse "Uygula" anlamsız; boş bırakılırsa silme onayına yönlendirilir
                             enabled = editedText != block.text,
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
                             onClick = {
                                 if (editedText.isBlank()) {
                                     showDeleteConfirmation = true
@@ -141,7 +148,7 @@ fun TextEditDialog(
                                 }
                             }
                         ) {
-                            Text("Uygula")
+                            Text("Uygula", maxLines = 1)
                         }
                     }
                 }

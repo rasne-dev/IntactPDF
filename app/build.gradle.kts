@@ -4,15 +4,15 @@ plugins {
 }
 
 android {
-    namespace = "dev.rasne.intactpdf"
+    namespace = "dev.rasne.intactfolio"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.rasne.intactpdf"
+        applicationId = "dev.rasne.intactfolio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.0.9"
+        versionCode = 11
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -71,6 +71,8 @@ dependencies {
 
     // PDFBox Android (Pure offline PDF parsing, text extraction, bounding box & modification)
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+
+    testImplementation("junit:junit:4.13.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

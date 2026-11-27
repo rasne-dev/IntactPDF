@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "IntactPDF"
+rootProject.name = "IntactFolio"
 include(":app")

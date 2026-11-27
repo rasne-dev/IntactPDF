@@ -1,4 +1,4 @@
-package dev.rasne.intactpdf.core
+package dev.rasne.intactfolio.core
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -14,8 +14,8 @@ import com.tom_roush.pdfbox.pdmodel.font.PDFont
 import com.tom_roush.pdfbox.pdmodel.font.PDType0Font
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import com.tom_roush.pdfbox.util.Matrix
-import dev.rasne.intactpdf.model.PdfTextBlock
-import dev.rasne.intactpdf.model.TextEditOperation
+import dev.rasne.intactfolio.model.PdfTextBlock
+import dev.rasne.intactfolio.model.TextEditOperation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -500,8 +500,9 @@ class PdfEngine(private val context: Context) {
                             }
                         }
 
+                        val baselineNormY = (newNormY + (targetFontSize * 1.15f / pageHeight)).coerceIn(0f, 1f)
                         val newX = newNormX * pageWidth
-                        val newY = pageHeight - (newNormY * pageHeight)
+                        val newY = pageHeight - (baselineNormY * pageHeight)
 
                         contentStream.beginText()
                         contentStream.setFont(font, targetFontSize)
@@ -515,8 +516,8 @@ class PdfEngine(private val context: Context) {
                         contentStream.endText()
                         contentStream.close()
 
-                        val topOfChar = newNormY - (targetFontSize * 1.15f / pageHeight)
-                        val bottomOfChar = newNormY + (targetFontSize * 0.35f / pageHeight)
+                        val topOfChar = newNormY
+                        val bottomOfChar = baselineNormY + (targetFontSize * 0.35f / pageHeight)
                         val normWidth = textWidth / pageWidth
 
                         val normRect = RectF(
@@ -535,7 +536,7 @@ class PdfEngine(private val context: Context) {
                         updatedBlock = block.copy(
                             normalizedBounds = normRect,
                             pdfBounds = pdfRect,
-                            baselineY = newNormY * pageHeight
+                            baselineY = baselineNormY * pageHeight
                         )
                     }
 
@@ -589,8 +590,7 @@ class PdfEngine(private val context: Context) {
             try {
                 closeRendererHandles()
 
-                var newCount = 0
-                PDDocument.load(targetFile).use { doc ->
+                val newCount = PDDocument.load(targetFile).use { doc ->
                     val referencePage = if (doc.numberOfPages > 0) {
                         doc.getPage(
                             if (insertAfterPageIndex in 0 until doc.numberOfPages) insertAfterPageIndex else 0
@@ -618,7 +618,7 @@ class PdfEngine(private val context: Context) {
                     }
 
                     saveAtomically(doc, targetFile)
-                    newCount = doc.numberOfPages
+                    doc.numberOfPages
                 }
 
                 currentFile = targetFile
@@ -644,7 +644,7 @@ class PdfEngine(private val context: Context) {
         contentStream.beginText()
         contentStream.setFont(PDType1Font.HELVETICA_BOLD, 22f)
         contentStream.newLineAtOffset(50f, 750f)
-        contentStream.showText("IntactPDF Ornek Belge")
+        contentStream.showText("IntactFolio Ornek Belge")
         contentStream.endText()
 
         // Subtitle

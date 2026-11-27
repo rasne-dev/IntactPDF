@@ -1,4 +1,4 @@
-package dev.rasne.intactpdf
+package dev.rasne.intactfolio
 
 import android.content.Intent
 import android.os.Bundle
@@ -11,8 +11,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.ui.graphics.Color
-import dev.rasne.intactpdf.ui.PdfViewModel
-import dev.rasne.intactpdf.ui.PdfViewerScreen
+import dev.rasne.intactfolio.ui.PdfViewModel
+import dev.rasne.intactfolio.ui.PdfViewerScreen
 
 /**
  * Marka renkleri (uygulama simgesi, mağaza görselleri ve web sitesindeki mavi). Daha önce Material'ın
